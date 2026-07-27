@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import json
 import os
+import re
+import unicodedata
 from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Iterator, Optional
@@ -103,6 +107,91 @@ DISPLAY_LABELS = {
     "note_prossimo_appuntamento": "Note prossimo app.",
     "note_generali": "Note generali",
     "canale_contatto_preferito": "Canale preferito",
+}
+
+# Campi importabili (senza id) e alias per suggerire il mapping automatico
+IMPORT_FIELDS = [c for c in COLUMNS if c != "id"]
+IMPORT_REQUIRED = ("cognome",)
+NONE_OPTION = "— non importare —"
+
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "cognome": (
+        "cognome",
+        "account cognome",
+        "account: cognome",
+        "surname",
+        "last name",
+        "lastname",
+    ),
+    "nome": (
+        "nome",
+        "account nome",
+        "account: nome",
+        "name",
+        "first name",
+        "firstname",
+    ),
+    "specializzazione": (
+        "specializzazione",
+        "specialita",
+        "specialità",
+        "1a specializzazione",
+        "account: 1a specializzazione",
+        "argomento di visita",
+        "specialty",
+    ),
+    "citta": ("citta", "città", "city", "comune", "localita", "località"),
+    "indirizzo": (
+        "indirizzo",
+        "indirizzo preferito",
+        "address",
+        "via",
+        "sede",
+    ),
+    "microarea": ("microarea", "area", "zona", "territorio"),
+    "telefono_fisso": ("telefono fisso", "tel fisso", "fisso", "phone", "telefono"),
+    "telefono_cellulare": (
+        "telefono cellulare",
+        "cellulare",
+        "cell",
+        "mobile",
+        "account: telefono",
+    ),
+    "email": ("email", "e-mail", "mail"),
+    "orario_lunedi": ("lunedi", "lunedì", "lun", "orario lunedi", "orario lunedì"),
+    "orario_martedi": ("martedi", "martedì", "mart", "orario martedi", "orario martedì"),
+    "orario_mercoledi": (
+        "mercoledi",
+        "mercoledì",
+        "merc",
+        "orario mercoledi",
+        "orario mercoledì",
+    ),
+    "orario_giovedi": ("giovedi", "giovedì", "giova", "orario giovedi", "orario giovedì"),
+    "orario_venerdi": ("venerdi", "venerdì", "ven", "orario venerdi", "orario venerdì"),
+    "data_ultima_visita": (
+        "data ultima visita",
+        "ultima visita",
+        "last visit",
+    ),
+    "data_prossimo_appuntamento": (
+        "data prossimo appuntamento",
+        "prossimo appuntamento",
+        "prox appuntamento",
+        "next appointment",
+    ),
+    "note_prossimo_appuntamento": (
+        "note prossimo appuntamento",
+        "note prossimo",
+        "note prox",
+    ),
+    "note_generali": ("note", "note generali", "notes", "commenti"),
+    "canale_contatto_preferito": (
+        "canale",
+        "canale preferito",
+        "canale di contatto preferito",
+        "contatto preferito",
+    ),
 }
 
 
@@ -297,6 +386,250 @@ def delete_medico(medico_id: int) -> None:
                 f"DELETE FROM {TABLE_NAME} WHERE id = %s",
                 (medico_id,),
             )
+
+
+def find_duplicate_id(
+    cognome: str,
+    nome: str,
+    citta: str,
+    indirizzo: str,
+) -> Optional[int]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id FROM {TABLE_NAME}
+                WHERE UPPER(cognome) = UPPER(%s)
+                  AND UPPER(nome) = UPPER(%s)
+                  AND UPPER(COALESCE(citta, '')) = UPPER(%s)
+                  AND UPPER(COALESCE(indirizzo, '')) = UPPER(%s)
+                LIMIT 1
+                """,
+                (cognome, nome, citta or "", indirizzo or ""),
+            )
+            row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def insert_medici_batch(records: list[dict[str, Any]]) -> int:
+    if not records:
+        return 0
+    fields = IMPORT_FIELDS
+    placeholders = ", ".join("%s" for _ in fields)
+    cols = ", ".join(fields)
+    values = [[rec.get(f) for f in fields] for rec in records]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                f"INSERT INTO {TABLE_NAME} ({cols}) VALUES ({placeholders})",
+                values,
+                page_size=100,
+            )
+    return len(records)
+
+
+# ---------------------------------------------------------------------------
+# Import helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_key(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_cell(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null", "nat"}:
+        return ""
+    return text
+
+
+def normalize_microarea(value: str) -> str:
+    key = _normalize_key(value)
+    if "monza" in key and "08" in key:
+        return "Monza Brianza 08"
+    if "milano" in key and "09" in key:
+        return "Milano 09"
+    for micro in MICROAREE:
+        if _normalize_key(micro) == key:
+            return micro
+    return ""
+
+
+def normalize_specializzazione(value: str) -> str:
+    key = _normalize_key(value)
+    for spec in SPECIALIZZAZIONI:
+        if _normalize_key(spec) == key:
+            return spec
+    # piccoli alias comuni
+    aliases = {
+        "mmg": "MMG",
+        "medicina generale": "MMG",
+        "medicina generica": "MMG",
+        "gastroenterologia": "Gastroenterogia",
+        "chirurgia vascolare": "Vascolare",
+    }
+    return aliases.get(key, "")
+
+
+def parse_import_date(value: Any) -> Optional[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = clean_cell(value)
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date().isoformat()
+        except ValueError:
+            continue
+    # pandas può lasciare timestamp stringhe lunghe
+    try:
+        return pd.to_datetime(text, dayfirst=True).date().isoformat()
+    except Exception:
+        return None
+
+
+def suggest_column_mapping(source_columns: list[str]) -> dict[str, str]:
+    normalized = {_normalize_key(col): col for col in source_columns}
+    mapping: dict[str, str] = {field: NONE_OPTION for field in IMPORT_FIELDS}
+
+    used: set[str] = set()
+    for field, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            source = normalized.get(_normalize_key(alias))
+            if source and source not in used:
+                mapping[field] = source
+                used.add(source)
+                break
+    return mapping
+
+
+def load_uploaded_dataframe(
+    uploaded_file: Any,
+    sheet_name: Optional[str] = None,
+) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.getvalue()
+    if name.endswith(".csv"):
+        # prova encoding comuni
+        for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+            try:
+                return pd.read_csv(io.BytesIO(raw), encoding=encoding, dtype=str)
+            except Exception:
+                continue
+        return pd.read_csv(io.BytesIO(raw), dtype=str)
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(
+            io.BytesIO(raw),
+            sheet_name=sheet_name if sheet_name is not None else 0,
+            dtype=str,
+            engine="openpyxl",
+        )
+    raise ValueError("Formato non supportato. Usa .xlsx o .csv (esporta da Numbers).")
+
+
+def list_excel_sheets(uploaded_file: Any) -> list[str]:
+    name = uploaded_file.name.lower()
+    if not name.endswith((".xlsx", ".xls")):
+        return []
+    xl = pd.ExcelFile(io.BytesIO(uploaded_file.getvalue()), engine="openpyxl")
+    return list(xl.sheet_names)
+
+
+def apply_mapping_to_row(
+    row: pd.Series,
+    mapping: dict[str, str],
+    defaults: dict[str, str],
+) -> dict[str, Any]:
+    data: dict[str, Any] = {field: "" for field in IMPORT_FIELDS}
+
+    for field, source_col in mapping.items():
+        if source_col == NONE_OPTION or source_col not in row.index:
+            continue
+        raw = row[source_col]
+        if field.startswith("data_"):
+            data[field] = parse_import_date(raw)
+        elif field == "microarea":
+            data[field] = normalize_microarea(clean_cell(raw))
+        elif field == "specializzazione":
+            data[field] = normalize_specializzazione(clean_cell(raw))
+        else:
+            data[field] = clean_cell(raw)
+
+    # default solo se campo vuoto
+    for field, value in defaults.items():
+        if not data.get(field):
+            data[field] = value
+
+    # date: stringa vuota -> None
+    for field in ("data_ultima_visita", "data_prossimo_appuntamento"):
+        if not data.get(field):
+            data[field] = None
+
+    return data
+
+
+def prepare_import_preview(
+    df: pd.DataFrame,
+    mapping: dict[str, str],
+    defaults: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Ritorna (validi, scartati, duplicati)."""
+    valid: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+
+    for idx, row in df.iterrows():
+        data = apply_mapping_to_row(row, mapping, defaults)
+        row_no = int(idx) + 2  # + header
+
+        if not data["cognome"]:
+            rejected.append(
+                {
+                    "riga": row_no,
+                    "motivo": "Manca il cognome",
+                    "cognome": data.get("cognome", ""),
+                    "nome": data.get("nome", ""),
+                }
+            )
+            continue
+
+        dup_id = find_duplicate_id(
+            data["cognome"],
+            data["nome"],
+            data.get("citta", "") or "",
+            data.get("indirizzo", "") or "",
+        )
+        if dup_id:
+            duplicates.append(
+                {
+                    "riga": row_no,
+                    "id_esistente": dup_id,
+                    "cognome": data["cognome"],
+                    "nome": data["nome"],
+                    "citta": data.get("citta", ""),
+                }
+            )
+            continue
+
+        valid.append(data)
+
+    return valid, rejected, duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +931,210 @@ def page_nuovo() -> None:
             st.balloons()
 
 
+def page_importa() -> None:
+    st.subheader("Importa medici")
+    st.caption(
+        "Carica un file **Excel (.xlsx)** o **CSV** esportato da Numbers. "
+        "Mappa le colonne del file sui campi del database, anteprima e conferma."
+    )
+
+    uploaded = st.file_uploader(
+        "File da importare",
+        type=["xlsx", "csv"],
+        help="Da Numbers: File → Esporta in Excel o CSV",
+        key="import_uploader",
+    )
+    if not uploaded:
+        st.info("Seleziona un file per iniziare.")
+        return
+
+    sheets = list_excel_sheets(uploaded)
+    sheet_name: Optional[str] = None
+    if sheets:
+        sheet_name = st.selectbox("Foglio Excel", options=sheets, key="import_sheet")
+
+    try:
+        df_source = load_uploaded_dataframe(uploaded, sheet_name=sheet_name)
+    except Exception as exc:
+        st.error(f"Impossibile leggere il file: {exc}")
+        return
+
+    if df_source.empty:
+        st.warning("Il foglio selezionato è vuoto.")
+        return
+
+    # Pulisci nomi colonne
+    df_source.columns = [str(c).strip() for c in df_source.columns]
+    source_cols = list(df_source.columns)
+
+    st.markdown("##### Anteprima file")
+    st.caption(f"{len(df_source)} righe · {len(source_cols)} colonne")
+    st.dataframe(df_source.head(8), width="stretch", hide_index=True)
+
+    st.markdown("---")
+    st.markdown("##### Mapping colonne")
+
+    # Template JSON
+    t1, t2 = st.columns(2)
+    with t1:
+        template_file = st.file_uploader(
+            "Carica template mapping (.json)",
+            type=["json"],
+            key="import_template_upload",
+        )
+    with t2:
+        st.caption("Puoi salvare il mapping corrente come template JSON e riusarlo.")
+
+    file_token = f"{uploaded.name}_{sheet_name or 'csv'}"
+    if "import_mapping" not in st.session_state or st.session_state.get(
+        "import_mapping_file"
+    ) != file_token:
+        st.session_state.import_mapping = suggest_column_mapping(source_cols)
+        st.session_state.import_mapping_file = file_token
+        st.session_state.import_ready = False
+        # reset widget keys del mapping precedente
+        for field in IMPORT_FIELDS:
+            st.session_state.pop(f"map_{file_token}_{field}", None)
+
+    if template_file is not None:
+        try:
+            loaded = json.loads(template_file.getvalue().decode("utf-8"))
+            if isinstance(loaded, dict):
+                for field in IMPORT_FIELDS:
+                    value = loaded.get(field, NONE_OPTION)
+                    if value in source_cols or value == NONE_OPTION:
+                        st.session_state.import_mapping[field] = value
+                        st.session_state[f"map_{file_token}_{field}"] = value
+                st.success("Template mapping applicato.")
+        except Exception as exc:
+            st.error(f"Template non valido: {exc}")
+
+    mapping: dict[str, str] = {}
+    options = [NONE_OPTION, *source_cols]
+    cols_ui = st.columns(2)
+    for i, field in enumerate(IMPORT_FIELDS):
+        with cols_ui[i % 2]:
+            current = st.session_state.import_mapping.get(field, NONE_OPTION)
+            if current not in options:
+                current = NONE_OPTION
+            widget_key = f"map_{file_token}_{field}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = current
+            label = DISPLAY_LABELS.get(field, field)
+            if field in IMPORT_REQUIRED:
+                label = f"{label} *"
+            mapping[field] = st.selectbox(
+                label,
+                options=options,
+                key=widget_key,
+            )
+    st.session_state.import_mapping = mapping
+
+    st.download_button(
+        "Scarica template mapping",
+        data=json.dumps(mapping, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="mapping_import_doctorale.json",
+        mime="application/json",
+    )
+
+    st.markdown("##### Valori di default (se colonna assente o vuota)")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        default_spec = st.selectbox(
+            "Specializzazione di default",
+            options=["(nessuna)", *SPECIALIZZAZIONI],
+            index=SPECIALIZZAZIONI.index("MMG") + 1,
+            key="import_default_spec",
+        )
+    with d2:
+        default_micro = st.selectbox(
+            "Microarea di default",
+            options=["(nessuna)", *MICROAREE],
+            key="import_default_micro",
+        )
+    with d3:
+        default_canale = st.selectbox(
+            "Canale preferito di default",
+            options=["(nessuna)", *CANALI_CONTATTO],
+            key="import_default_canale",
+        )
+
+    defaults: dict[str, str] = {}
+    if default_spec != "(nessuna)":
+        defaults["specializzazione"] = default_spec
+    if default_micro != "(nessuna)":
+        defaults["microarea"] = default_micro
+    if default_canale != "(nessuna)":
+        defaults["canale_contatto_preferito"] = default_canale
+
+    if mapping.get("cognome") == NONE_OPTION:
+        st.warning("Devi mappare almeno **Cognome**.")
+        return
+
+    st.markdown("---")
+    if st.button("Analizza file (dry-run)", type="primary", key="import_dry_run"):
+        with st.spinner("Analisi in corso…"):
+            valid, rejected, duplicates = prepare_import_preview(
+                df_source, mapping, defaults
+            )
+        st.session_state.import_valid = valid
+        st.session_state.import_rejected = rejected
+        st.session_state.import_duplicates = duplicates
+        st.session_state.import_ready = True
+
+    if not st.session_state.get("import_ready"):
+        return
+
+    valid = st.session_state.get("import_valid", [])
+    rejected = st.session_state.get("import_rejected", [])
+    duplicates = st.session_state.get("import_duplicates", [])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Da inserire", len(valid))
+    m2.metric("Scartati", len(rejected))
+    m3.metric("Duplicati (saltati)", len(duplicates))
+
+    if valid:
+        st.markdown("###### Anteprima record da inserire")
+        preview_cols = [
+            "cognome",
+            "nome",
+            "specializzazione",
+            "citta",
+            "indirizzo",
+            "microarea",
+        ]
+        st.dataframe(
+            pd.DataFrame(valid)[preview_cols].head(20),
+            width="stretch",
+            hide_index=True,
+        )
+    if rejected:
+        with st.expander(f"Righe scartate ({len(rejected)})"):
+            st.dataframe(pd.DataFrame(rejected), width="stretch", hide_index=True)
+    if duplicates:
+        with st.expander(f"Duplicati già in anagrafica ({len(duplicates)})"):
+            st.dataframe(pd.DataFrame(duplicates), width="stretch", hide_index=True)
+
+    if not valid:
+        st.info("Nessun record nuovo da inserire.")
+        return
+
+    if st.button(
+        f"Conferma import di {len(valid)} medici",
+        type="primary",
+        key="import_confirm",
+    ):
+        with st.spinner("Import in corso…"):
+            count = insert_medici_batch(valid)
+        st.success(f"Import completato: {count} medici inseriti.")
+        st.balloons()
+        st.session_state.import_ready = False
+        st.session_state.pop("import_valid", None)
+        st.session_state.pop("import_rejected", None)
+        st.session_state.pop("import_duplicates", None)
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -631,7 +1168,7 @@ def main() -> None:
         st.caption(f"Utente: **{st.session_state.get('username', '')}**")
         pagina = st.radio(
             "Menu",
-            options=["Elenco e ricerca", "Nuovo medico"],
+            options=["Elenco e ricerca", "Nuovo medico", "Importa"],
             label_visibility="collapsed",
         )
         st.markdown("---")
@@ -642,8 +1179,10 @@ def main() -> None:
 
     if pagina == "Elenco e ricerca":
         page_elenco()
-    else:
+    elif pagina == "Nuovo medico":
         page_nuovo()
+    else:
+        page_importa()
 
 
 if __name__ == "__main__":
