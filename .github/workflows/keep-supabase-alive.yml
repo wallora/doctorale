@@ -1,0 +1,43 @@
+name: Keep Supabase alive
+
+on:
+  schedule:
+    # Ogni 3 giorni alle 08:00 UTC (~10:00 Italia in estate)
+    - cron: "0 8 */3 * *"
+  workflow_dispatch: # consente esecuzione manuale da GitHub
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Ping Supabase
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          import psycopg2
+
+          url = os.environ.get("DATABASE_URL")
+          if not url:
+              print("DATABASE_URL secret mancante", file=sys.stderr)
+              sys.exit(1)
+
+          conn = psycopg2.connect(url)
+          try:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT 1")
+                  print("supabase_ok", cur.fetchone())
+          finally:
+              conn.close()
+          PY
