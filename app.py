@@ -308,6 +308,7 @@ def _str_to_date(value: Any) -> Optional[date]:
 def search_medici(
     query: str = "",
     microarea: Optional[str] = None,
+    specializzazione: Optional[str] = None,
 ) -> pd.DataFrame:
     sql = f"SELECT * FROM {TABLE_NAME} WHERE 1=1"
     params: list[Any] = []
@@ -318,15 +319,18 @@ def search_medici(
             AND (
                 nome ILIKE %s
                 OR cognome ILIKE %s
-                OR specializzazione ILIKE %s
                 OR citta ILIKE %s
             )
         """
-        params.extend([like, like, like, like])
+        params.extend([like, like, like])
 
     if microarea and microarea != "Tutte":
         sql += " AND microarea = %s"
         params.append(microarea)
+
+    if specializzazione and specializzazione != "Tutte":
+        sql += " AND specializzazione = %s"
+        params.append(specializzazione)
 
     sql += " ORDER BY cognome ASC, nome ASC"
 
@@ -386,6 +390,23 @@ def delete_medico(medico_id: int) -> None:
                 f"DELETE FROM {TABLE_NAME} WHERE id = %s",
                 (medico_id,),
             )
+
+
+def count_medici() -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}")
+            return int(cur.fetchone()[0])
+
+
+def reset_all_medici() -> int:
+    """Elimina tutti i record e resetta la sequenza id. Ritorna quanti erano."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}")
+            total = int(cur.fetchone()[0])
+            cur.execute(f"TRUNCATE TABLE {TABLE_NAME} RESTART IDENTITY")
+    return total
 
 
 def find_duplicate_id(
@@ -824,23 +845,31 @@ def page_login() -> None:
 def page_elenco() -> None:
     st.subheader("Elenco medici")
 
-    f1, f2 = st.columns([3, 1])
+    f1, f2, f3 = st.columns([3, 1.2, 1.2])
     with f1:
         query = st.text_input(
-            "Cerca",
-            placeholder="Nome, cognome, specializzazione o città…",
-            label_visibility="collapsed",
+            "Ricerca",
+            placeholder="Nome, cognome o città…",
             key="search_query",
         )
     with f2:
+        spec_filter = st.selectbox(
+            "Specializzazione",
+            options=["Tutte", *SPECIALIZZAZIONI],
+            key="search_spec",
+        )
+    with f3:
         micro_filter = st.selectbox(
             "Microarea",
             options=["Tutte", *MICROAREE],
-            label_visibility="collapsed",
             key="search_micro",
         )
 
-    df = search_medici(query=query, microarea=micro_filter)
+    df = search_medici(
+        query=query,
+        microarea=micro_filter,
+        specializzazione=spec_filter,
+    )
 
     st.caption(f"{len(df)} medic{'o' if len(df) == 1 else 'i'} trovati")
 
@@ -1135,6 +1164,46 @@ def page_importa() -> None:
         st.session_state.pop("import_duplicates", None)
 
 
+def page_impostazioni() -> None:
+    st.subheader("Impostazioni")
+
+    total = count_medici()
+    st.caption(f"Record attualmente in anagrafica: **{total}**")
+
+    st.markdown("---")
+    st.markdown("##### Zona pericolosa")
+    st.warning(
+        "Questa operazione elimina **tutti** i medici dal database in modo permanente. "
+        "Non è recuperabile."
+    )
+
+    with st.form("reset_db_form"):
+        confirm_text = st.text_input(
+            'Per confermare digita esattamente: ELIMINA TUTTO',
+            key="reset_confirm_text",
+        )
+        password = st.text_input(
+            "Password di login",
+            type="password",
+            key="reset_password",
+        )
+        submitted = st.form_submit_button(
+            "Svuota database",
+            type="primary",
+            width="stretch",
+        )
+
+        if submitted:
+            if confirm_text.strip() != "ELIMINA TUTTO":
+                st.error('Testo di conferma non corretto. Digita esattamente: ELIMINA TUTTO')
+            elif not verify_password(password):
+                st.error("Password di login non valida.")
+            else:
+                deleted = reset_all_medici()
+                st.success(f"Database svuotato. Eliminati {deleted} record.")
+                st.session_state.import_ready = False
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -1168,7 +1237,7 @@ def main() -> None:
         st.caption(f"Utente: **{st.session_state.get('username', '')}**")
         pagina = st.radio(
             "Menu",
-            options=["Elenco e ricerca", "Nuovo medico", "Importa"],
+            options=["Elenco e ricerca", "Nuovo medico", "Importa", "Impostazioni"],
             label_visibility="collapsed",
         )
         st.markdown("---")
@@ -1181,8 +1250,10 @@ def main() -> None:
         page_elenco()
     elif pagina == "Nuovo medico":
         page_nuovo()
-    else:
+    elif pagina == "Importa":
         page_importa()
+    else:
+        page_impostazioni()
 
 
 if __name__ == "__main__":
