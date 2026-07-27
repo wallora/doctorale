@@ -21,12 +21,13 @@ import streamlit as st
 # Configurazione
 # ---------------------------------------------------------------------------
 
-# Credenziali: username in chiaro, password hashata con PBKDF2-HMAC-SHA256.
-# Hash generato con: salt = b"doctorale_salt_v1", iterations = 260000
-# Password di default: admin123  →  cambia HASH e USERNAME prima di un uso reale.
-AUTH_USERNAME = "admin"
+# Credenziali login: preferisci i Secrets (locale o Streamlit Cloud).
+# Fallback hardcoded solo per sviluppo locale senza secrets.
+# Per generare un nuovo hash:
+#   python -c "import hashlib,base64; print(base64.b64encode(hashlib.pbkdf2_hmac('sha256', b'NUOVA_PASSWORD', b'doctorale_salt_v1', 260000)).decode())"
+DEFAULT_AUTH_USERNAME = "admin"
 AUTH_PASSWORD_SALT = b"doctorale_salt_v1"
-AUTH_PASSWORD_HASH = "TNBQkbqxlofbt8MPQi+UZBitspP8OiI1m+0e0L7xxXA="
+DEFAULT_AUTH_PASSWORD_HASH = "TNBQkbqxlofbt8MPQi+UZBitspP8OiI1m+0e0L7xxXA="
 AUTH_PBKDF2_ITERATIONS = 260_000
 
 TABLE_NAME = "doctors"
@@ -109,6 +110,26 @@ DISPLAY_LABELS = {
 # Autenticazione
 # ---------------------------------------------------------------------------
 
+def get_auth_username() -> str:
+    try:
+        username = st.secrets.get("AUTH_USERNAME")
+        if username:
+            return str(username)
+    except Exception:
+        pass
+    return DEFAULT_AUTH_USERNAME
+
+
+def get_auth_password_hash() -> str:
+    try:
+        password_hash = st.secrets.get("AUTH_PASSWORD_HASH")
+        if password_hash:
+            return str(password_hash)
+    except Exception:
+        pass
+    return DEFAULT_AUTH_PASSWORD_HASH
+
+
 def verify_password(password: str) -> bool:
     dk = hashlib.pbkdf2_hmac(
         "sha256",
@@ -116,11 +137,11 @@ def verify_password(password: str) -> bool:
         AUTH_PASSWORD_SALT,
         AUTH_PBKDF2_ITERATIONS,
     )
-    return base64.b64encode(dk).decode("ascii") == AUTH_PASSWORD_HASH
+    return base64.b64encode(dk).decode("ascii") == get_auth_password_hash()
 
 
 def check_login(username: str, password: str) -> bool:
-    return username == AUTH_USERNAME and verify_password(password)
+    return username == get_auth_username() and verify_password(password)
 
 
 # ---------------------------------------------------------------------------
