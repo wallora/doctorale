@@ -20,6 +20,16 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import streamlit as st
+import altair as alt
+
+from sales_parser import (
+    MESI_LABEL,
+    infer_period_from_filename,
+    infer_period_from_workbook,
+    list_sheet_names,
+    parse_sales_workbook,
+    suggest_sheets,
+)
 
 # ---------------------------------------------------------------------------
 # Configurazione
@@ -35,6 +45,7 @@ DEFAULT_AUTH_PASSWORD_HASH = "TNBQkbqxlofbt8MPQi+UZBitspP8OiI1m+0e0L7xxXA="
 AUTH_PBKDF2_ITERATIONS = 260_000
 
 TABLE_NAME = "doctors"
+SALES_TABLE = "sales_data"
 
 MICROAREE = ("Monza Brianza 08", "Milano 09")
 GIORNI = ("lunedi", "martedi", "mercoledi", "giovedi", "venerdi")
@@ -268,7 +279,7 @@ def get_connection() -> Iterator[psycopg2.extensions.connection]:
 
 
 def init_db() -> None:
-    """Verifica che la tabella esista (creata da SQL Editor su Supabase)."""
+    """Verifica doctors e crea sales_data se manca."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -284,6 +295,70 @@ def init_db() -> None:
                     f"Tabella '{TABLE_NAME}' non trovata su Supabase. "
                     "Creala dall'SQL Editor prima di usare l'app."
                 )
+
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SALES_TABLE} (
+                    id BIGSERIAL PRIMARY KEY,
+                    anno INTEGER NOT NULL,
+                    mese INTEGER NOT NULL,
+                    metrica TEXT NOT NULL,
+                    livello TEXT NOT NULL,
+                    informatore TEXT NOT NULL DEFAULT '',
+                    microarea TEXT NOT NULL DEFAULT '',
+                    prodotto TEXT NOT NULL,
+                    vendita_ap DOUBLE PRECISION,
+                    vendita DOUBLE PRECISION,
+                    pct_italia DOUBLE PRECISION,
+                    crescita_pct DOUBLE PRECISION,
+                    imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            # Chiave primaria logica: microarea (+ periodo/metrica/prodotto).
+            # L'informatore è uno snapshot storico del periodo (può cambiare nel tempo).
+            cur.execute(f"DROP INDEX IF EXISTS {SALES_TABLE}_uniq")
+            cur.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS {SALES_TABLE}_microarea_uniq
+                ON {SALES_TABLE} (anno, mese, metrica, microarea, prodotto)
+                WHERE livello = 'microarea'
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS {SALES_TABLE}_aggregati_uniq
+                ON {SALES_TABLE} (anno, mese, metrica, livello, informatore, prodotto)
+                WHERE livello <> 'microarea'
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {SALES_TABLE}_periodo_idx
+                ON {SALES_TABLE} (anno, mese)
+                """
+            )
+            cur.execute(f"ALTER TABLE {SALES_TABLE} ENABLE ROW LEVEL SECURITY")
+
+            # Ferrari Raffaella è l'AM, non un informatore
+            cur.execute(
+                f"""
+                DELETE FROM {SALES_TABLE}
+                WHERE livello IN ('informatore', 'microarea')
+                  AND (
+                    informatore ILIKE 'ferrari raffaella%'
+                    OR LOWER(TRIM(informatore)) = 'ferrari'
+                  )
+                """
+            )
+            cur.execute(
+                f"""
+                UPDATE {SALES_TABLE}
+                SET informatore = ''
+                WHERE livello IN ('am', 'italia')
+                  AND informatore <> ''
+                """
+            )
 
 
 def _date_to_str(value: Optional[date]) -> Optional[str]:
@@ -407,6 +482,441 @@ def reset_all_medici() -> int:
             total = int(cur.fetchone()[0])
             cur.execute(f"TRUNCATE TABLE {TABLE_NAME} RESTART IDENTITY")
     return total
+
+
+def count_sales_for_period(anno: int, mese: int) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {SALES_TABLE} WHERE anno = %s AND mese = %s",
+                (anno, mese),
+            )
+            return int(cur.fetchone()[0])
+
+
+def delete_sales_period(anno: int, mese: int) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {SALES_TABLE} WHERE anno = %s AND mese = %s",
+                (anno, mese),
+            )
+            return int(cur.rowcount)
+
+
+def insert_sales_records(anno: int, mese: int, records: list[Any]) -> int:
+    if not records:
+        return 0
+
+    # Deduplica per chiave logica: per le microaree l'informatore non fa parte della chiave
+    deduped: dict[tuple, Any] = {}
+    for r in records:
+        if r.livello == "microarea":
+            if not (r.microarea or "").strip():
+                continue
+            key = (r.metrica, "microarea", r.microarea.strip().upper(), r.prodotto)
+            # normalizza microarea in maiuscolo
+            r.microarea = r.microarea.strip().upper()
+        else:
+            key = (
+                r.metrica,
+                r.livello,
+                (r.informatore or "").strip(),
+                r.prodotto,
+            )
+        deduped[key] = r
+
+    values = [
+        (
+            anno,
+            mese,
+            r.metrica,
+            r.livello,
+            r.informatore or "",
+            r.microarea or "",
+            r.prodotto,
+            r.vendita_ap,
+            r.vendita,
+            r.pct_italia,
+            r.crescita_pct,
+        )
+        for r in deduped.values()
+    ]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                f"""
+                INSERT INTO {SALES_TABLE} (
+                    anno, mese, metrica, livello, informatore, microarea, prodotto,
+                    vendita_ap, vendita, pct_italia, crescita_pct
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                values,
+                page_size=200,
+            )
+    return len(values)
+
+
+def search_sales(
+    anno: Optional[int] = None,
+    mese: Optional[int] = None,
+    metrica: Optional[str] = None,
+    livello: Optional[str] = None,
+    prodotto: Optional[str] = None,
+    informatore: Optional[str] = None,
+    microarea: Optional[str] = None,
+) -> pd.DataFrame:
+    sql = f"SELECT * FROM {SALES_TABLE} WHERE 1=1"
+    params: list[Any] = []
+    if anno:
+        sql += " AND anno = %s"
+        params.append(anno)
+    if mese:
+        sql += " AND mese = %s"
+        params.append(mese)
+    if metrica and metrica != "Tutte":
+        sql += " AND metrica = %s"
+        params.append(metrica)
+    if livello and livello != "Tutti":
+        sql += " AND livello = %s"
+        params.append(livello)
+    if prodotto and prodotto != "Tutti":
+        sql += " AND prodotto = %s"
+        params.append(prodotto)
+    if informatore and informatore != "Tutti":
+        sql += " AND informatore ILIKE %s"
+        params.append(informatore)
+    if microarea and microarea != "Tutte":
+        sql += " AND microarea = %s"
+        params.append(microarea)
+    sql += " ORDER BY anno DESC, mese DESC, microarea, prodotto, metrica, livello"
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def list_sales_filter_values() -> dict[str, list[Any]]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT DISTINCT anno FROM {SALES_TABLE} ORDER BY anno DESC")
+            anni = [r[0] for r in cur.fetchall()]
+            cur.execute(f"SELECT DISTINCT mese FROM {SALES_TABLE} ORDER BY mese")
+            mesi = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                f"SELECT DISTINCT prodotto FROM {SALES_TABLE} ORDER BY prodotto"
+            )
+            prodotti = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                f"""
+                SELECT DISTINCT informatore FROM {SALES_TABLE}
+                WHERE informatore <> ''
+                  AND livello IN ('informatore', 'microarea')
+                  AND informatore NOT ILIKE 'ferrari raffaella%'
+                  AND LOWER(informatore) <> 'ferrari'
+                ORDER BY informatore
+                """
+            )
+            informatori = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                f"""
+                SELECT DISTINCT microarea FROM {SALES_TABLE}
+                WHERE microarea <> '' ORDER BY microarea
+                """
+            )
+            microaree = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                f"""
+                SELECT DISTINCT anno, mese FROM {SALES_TABLE}
+                ORDER BY anno ASC, mese ASC
+                """
+            )
+            periodi = [(int(r[0]), int(r[1])) for r in cur.fetchall()]
+    return {
+        "anni": anni,
+        "mesi": mesi,
+        "prodotti": prodotti,
+        "informatori": informatori,
+        "microaree": microaree,
+        "periodi": periodi,
+    }
+
+
+def _entity_norm(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower().replace("`", "").strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def _match_name_to_existing(value: str, existing: list[str]) -> tuple[str, str]:
+    """Ritorna (stato, valore_db).
+
+    stato: 'già presente' | 'associato' | 'nuovo'
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return "nuovo", ""
+    key = _entity_norm(raw)
+    existing_norm = {_entity_norm(e): e for e in existing if e}
+
+    if key in existing_norm:
+        return "già presente", existing_norm[key]
+
+    # Match per prefisso / cognome (utile per informatori)
+    candidates: list[str] = []
+    for e_key, e_val in existing_norm.items():
+        if key.startswith(e_key + " ") or e_key.startswith(key + " "):
+            candidates.append(e_val)
+            continue
+        if key.split()[0] == e_key.split()[0] and (
+            " " in key or " " in e_key
+        ):
+            candidates.append(e_val)
+
+    # Unico candidato chiaro
+    uniq = sorted(set(candidates), key=lambda x: (-len(x), x))
+    if len(uniq) == 1:
+        return "associato", uniq[0]
+    if len(uniq) > 1:
+        # preferisci quello con più token in comune
+        best = max(
+            uniq,
+            key=lambda x: len(set(_entity_norm(x).split()) & set(key.split())),
+        )
+        return "associato", best
+
+    return "nuovo", ""
+
+
+def build_sales_match_report(records: list[Any]) -> dict[str, pd.DataFrame]:
+    """Confronta entità del file con quelle già presenti a DB."""
+    existing = list_sales_filter_values()
+    file_inf = sorted(
+        {
+            (r.informatore or "").strip()
+            for r in records
+            if (r.informatore or "").strip()
+        }
+    )
+    file_prod = sorted(
+        {(r.prodotto or "").strip() for r in records if (r.prodotto or "").strip()}
+    )
+    file_micro = sorted(
+        {
+            (r.microarea or "").strip().upper()
+            for r in records
+            if (r.livello == "microarea" and (r.microarea or "").strip())
+        }
+    )
+
+    def rows_for(values: list[str], existing_values: list[str]) -> list[dict[str, str]]:
+        out = []
+        for value in values:
+            stato, matched = _match_name_to_existing(value, existing_values)
+            out.append(
+                {
+                    "Nel file": value,
+                    "Stato": stato,
+                    "Associato a DB": matched if matched else "—",
+                }
+            )
+        return out
+
+    return {
+        "informatori": pd.DataFrame(
+            rows_for(file_inf, existing["informatori"])
+        ),
+        "prodotti": pd.DataFrame(rows_for(file_prod, existing["prodotti"])),
+        "microaree": pd.DataFrame(rows_for(file_micro, existing["microaree"])),
+    }
+
+
+def apply_sales_entity_mapping(records: list[Any]) -> list[Any]:
+    """Allinea i nomi del file a quelli già presenti a DB quando c'è match."""
+    existing = list_sales_filter_values()
+    inf_map: dict[str, str] = {}
+    prod_map: dict[str, str] = {}
+    micro_map: dict[str, str] = {}
+
+    for r in records:
+        inf = (r.informatore or "").strip()
+        if inf and inf not in inf_map:
+            stato, matched = _match_name_to_existing(inf, existing["informatori"])
+            inf_map[inf] = matched if stato != "nuovo" and matched else inf
+
+        prod = (r.prodotto or "").strip()
+        if prod and prod not in prod_map:
+            stato, matched = _match_name_to_existing(prod, existing["prodotti"])
+            prod_map[prod] = matched if stato != "nuovo" and matched else prod
+
+        if r.livello == "microarea":
+            micro = (r.microarea or "").strip().upper()
+            if micro and micro not in micro_map:
+                stato, matched = _match_name_to_existing(micro, existing["microaree"])
+                micro_map[micro] = (
+                    matched if stato != "nuovo" and matched else micro
+                )
+
+    for r in records:
+        if r.informatore:
+            r.informatore = inf_map.get(r.informatore.strip(), r.informatore)
+        if r.prodotto:
+            r.prodotto = prod_map.get(r.prodotto.strip(), r.prodotto)
+        if r.livello == "microarea" and r.microarea:
+            key = r.microarea.strip().upper()
+            r.microarea = micro_map.get(key, key)
+
+    return records
+
+
+def _period_label(period: tuple[int, int]) -> str:
+    anno, mese = period
+    return f"{MESI_LABEL.get(mese, mese)} {anno}"
+
+
+def _period_sort_key(period: tuple[int, int]) -> int:
+    anno, mese = period
+    return anno * 12 + mese
+
+
+def _informatore_cognome(name: str) -> str:
+    """Estrae il cognome per etichette legenda compatte."""
+    parts = [p for p in str(name or "").strip().split() if p]
+    if not parts:
+        return str(name or "")
+    particles = {"di", "de", "del", "della", "dei", "degli", "dal", "dalla", "da"}
+    first = parts[0].lower().rstrip("'")
+    if len(parts) >= 2 and (first in particles or parts[0].lower().startswith("d'")):
+        return f"{parts[0]} {parts[1]}"
+    return parts[0]
+
+
+def fetch_sales_trend(
+    metrica: str,
+    valore: str,
+    dimensione: str,
+    entities: list[str],
+    prodotti: list[str],
+    period_from: tuple[int, int],
+    period_to: tuple[int, int],
+    include_italia: bool = False,
+    include_am: bool = False,
+) -> pd.DataFrame:
+    """Serie temporali per grafico andamento.
+
+    valore: 'vendita' | 'crescita_pct'
+    """
+    if (not entities and not include_italia and not include_am) or not prodotti:
+        return pd.DataFrame()
+
+    start_key = _period_sort_key(period_from)
+    end_key = _period_sort_key(period_to)
+    if start_key > end_key:
+        period_from, period_to = period_to, period_from
+        start_key, end_key = end_key, start_key
+
+    if valore == "crescita_pct":
+        value_expr = "AVG(crescita_pct)"
+    else:
+        value_expr = "SUM(vendita)"
+
+    frames: list[pd.DataFrame] = []
+
+    def _load(
+        sql: str,
+        params: list[Any],
+        serie_builder,
+    ) -> None:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        if not rows:
+            return
+        part = pd.DataFrame([dict(r) for r in rows])
+        part["periodo"] = pd.to_datetime(
+            dict(year=part["anno"], month=part["mese"], day=1)
+        )
+        labels = serie_builder(part)
+        part["serie"] = labels["short"]
+        part["serie_full"] = labels["full"]
+        frames.append(part)
+
+    if entities:
+        if dimensione == "Informatore":
+            livello = "informatore"
+            entity_col = "informatore"
+        else:
+            livello = "microarea"
+            entity_col = "microarea"
+
+        sql = f"""
+            SELECT anno, mese, {entity_col} AS entita, prodotto,
+                   {value_expr} AS valore
+            FROM {SALES_TABLE}
+            WHERE metrica = %s
+              AND livello = %s
+              AND {entity_col} = ANY(%s)
+              AND prodotto = ANY(%s)
+              AND (anno * 12 + mese) BETWEEN %s AND %s
+            GROUP BY anno, mese, {entity_col}, prodotto
+            ORDER BY anno, mese, {entity_col}, prodotto
+        """
+        params = [metrica, livello, entities, prodotti, start_key, end_key]
+
+        def _serie_entities(df: pd.DataFrame) -> dict[str, pd.Series]:
+            full = df["entita"].astype(str)
+            if dimensione == "Informatore":
+                short = full.map(_informatore_cognome)
+            else:
+                short = full
+            if len(prodotti) > 1:
+                prod = df["prodotto"].astype(str)
+                return {
+                    "short": short + " — " + prod,
+                    "full": full + " — " + prod,
+                }
+            return {"short": short, "full": full}
+
+        _load(sql, params, _serie_entities)
+
+    for enabled, livello, label in (
+        (include_italia, "italia", "Totale Italia"),
+        (include_am, "am", "Totale AM"),
+    ):
+        if not enabled:
+            continue
+        sql = f"""
+            SELECT anno, mese, prodotto, {value_expr} AS valore
+            FROM {SALES_TABLE}
+            WHERE metrica = %s
+              AND livello = %s
+              AND prodotto = ANY(%s)
+              AND (anno * 12 + mese) BETWEEN %s AND %s
+            GROUP BY anno, mese, prodotto
+            ORDER BY anno, mese, prodotto
+        """
+        params = [metrica, livello, prodotti, start_key, end_key]
+
+        def _serie_agg(df: pd.DataFrame, lbl: str = label) -> dict[str, pd.Series]:
+            if len(prodotti) == 1:
+                series = pd.Series([lbl] * len(df), index=df.index)
+            else:
+                series = pd.Series(
+                    [f"{lbl} — {p}" for p in df["prodotto"].astype(str)],
+                    index=df.index,
+                )
+            return {"short": series, "full": series}
+
+        _load(sql, params, _serie_agg)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def find_duplicate_id(
@@ -1164,6 +1674,488 @@ def page_importa() -> None:
         st.session_state.pop("import_duplicates", None)
 
 
+def page_dati_importa() -> None:
+    st.subheader("Importa dati di vendita")
+    st.caption(
+        "Carica l’Excel mensile (fogli unità e fatturato). "
+        "La **microarea** è la chiave dei dati: l’informatore viene salvato come "
+        "assegnazione storica del periodo (può cambiare nel tempo). "
+        "I prodotti possono comparire o sparire di mese in mese."
+    )
+
+    uploaded = st.file_uploader(
+        "File Excel vendite",
+        type=["xlsx"],
+        key="sales_uploader",
+    )
+    if not uploaded:
+        st.info("Seleziona un file .xlsx per iniziare.")
+        return
+
+    raw = uploaded.getvalue()
+    try:
+        sheets = list_sheet_names(raw)
+    except Exception as exc:
+        st.error(f"Impossibile leggere il file: {exc}")
+        return
+
+    suggested_unita, suggested_valori = suggest_sheets(sheets)
+    anno_file, mese_file = infer_period_from_filename(uploaded.name)
+    anno_wb, mese_wb = infer_period_from_workbook(raw)
+    anno_default = anno_file or anno_wb or date.today().year
+    mese_default = mese_file or mese_wb or date.today().month
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        anno = st.number_input(
+            "Anno",
+            min_value=2000,
+            max_value=2100,
+            value=int(anno_default),
+            step=1,
+            key="sales_anno",
+        )
+    with c2:
+        mese = st.selectbox(
+            "Mese",
+            options=list(range(1, 13)),
+            index=int(mese_default) - 1,
+            format_func=lambda m: MESI_LABEL[m],
+            key="sales_mese",
+        )
+    with c3:
+        sheet_unita = st.selectbox(
+            "Foglio unità",
+            options=sheets,
+            index=sheets.index(suggested_unita) if suggested_unita in sheets else 0,
+            key="sales_sheet_unita",
+        )
+    with c4:
+        sheet_valori = st.selectbox(
+            "Foglio fatturato",
+            options=sheets,
+            index=sheets.index(suggested_valori) if suggested_valori in sheets else 0,
+            key="sales_sheet_valori",
+        )
+
+    existing = count_sales_for_period(int(anno), int(mese))
+    if existing:
+        st.warning(
+            f"Esistono già **{existing}** record per {MESI_LABEL[int(mese)]} {int(anno)}. "
+            "Confermando l’import verranno sostituiti."
+        )
+
+    if st.button("Analizza file", type="primary", key="sales_dry_run"):
+        try:
+            records = parse_sales_workbook(raw, sheet_unita, sheet_valori)
+            match_report = build_sales_match_report(records)
+            records = apply_sales_entity_mapping(records)
+        except Exception as exc:
+            st.error(f"Errore parsing: {exc}")
+            return
+        st.session_state.sales_records = records
+        st.session_state.sales_match_report = match_report
+        st.session_state.sales_period = (int(anno), int(mese))
+        st.session_state.sales_ready = True
+
+    if not st.session_state.get("sales_ready"):
+        return
+
+    records = st.session_state.get("sales_records", [])
+    period = st.session_state.get("sales_period")
+    match_report = st.session_state.get("sales_match_report")
+    if not records or not period:
+        return
+
+    p_anno, p_mese = period
+    st.markdown(
+        f"##### Anteprima — {MESI_LABEL[p_mese]} {p_anno} · {len(records)} record"
+    )
+
+    preview_df = pd.DataFrame(
+        [
+            {
+                "metrica": r.metrica,
+                "livello": r.livello,
+                "informatore": r.informatore,
+                "microarea": r.microarea,
+                "prodotto": r.prodotto,
+                "vendita_ap": r.vendita_ap,
+                "vendita": r.vendita,
+                "pct_italia": r.pct_italia,
+                "crescita_pct": r.crescita_pct,
+            }
+            for r in records
+        ]
+    )
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Unità", int((preview_df["metrica"] == "unita").sum()))
+    g2.metric("Fatturato", int((preview_df["metrica"] == "fatturato").sum()))
+    g3.metric("Microaree (righe)", int((preview_df["livello"] == "microarea").sum()))
+
+    st.markdown("##### Associazione con anagrafica già in DB")
+    st.caption(
+        "**già presente** = corrispondenza esatta · "
+        "**associato** = abbinato a una voce simile già nota · "
+        "**nuovo** = non trovato, verrà creato al prossimo import"
+    )
+
+    if match_report is None:
+        st.info("Rilancia Analizza file per vedere il report di associazione.")
+    else:
+        tab_inf, tab_prod, tab_micro = st.tabs(
+            ["Informatori", "Prodotti", "Microaree"]
+        )
+        with tab_inf:
+            df_inf = match_report["informatori"]
+            if df_inf.empty:
+                st.info("Nessun informatore nel file.")
+            else:
+                c_ok = int((df_inf["Stato"] == "già presente").sum())
+                c_as = int((df_inf["Stato"] == "associato").sum())
+                c_new = int((df_inf["Stato"] == "nuovo").sum())
+                st.caption(
+                    f"{len(df_inf)} trovati · {c_ok} già presenti · "
+                    f"{c_as} associati · {c_new} nuovi"
+                )
+                st.dataframe(df_inf, width="stretch", hide_index=True)
+        with tab_prod:
+            df_prod = match_report["prodotti"]
+            if df_prod.empty:
+                st.info("Nessun prodotto nel file.")
+            else:
+                c_ok = int((df_prod["Stato"] == "già presente").sum())
+                c_as = int((df_prod["Stato"] == "associato").sum())
+                c_new = int((df_prod["Stato"] == "nuovo").sum())
+                st.caption(
+                    f"{len(df_prod)} trovati · {c_ok} già presenti · "
+                    f"{c_as} associati · {c_new} nuovi"
+                )
+                st.dataframe(df_prod, width="stretch", hide_index=True)
+        with tab_micro:
+            df_micro = match_report["microaree"]
+            if df_micro.empty:
+                st.info("Nessuna microarea nel file.")
+            else:
+                c_ok = int((df_micro["Stato"] == "già presente").sum())
+                c_as = int((df_micro["Stato"] == "associato").sum())
+                c_new = int((df_micro["Stato"] == "nuovo").sum())
+                st.caption(
+                    f"{len(df_micro)} trovate · {c_ok} già presenti · "
+                    f"{c_as} associate · {c_new} nuove"
+                )
+                st.dataframe(df_micro, width="stretch", hide_index=True)
+
+    with st.expander("Anteprima prime 30 righe dati"):
+        st.dataframe(preview_df.head(30), width="stretch", hide_index=True)
+
+    if st.button(
+        f"Conferma import ({len(records)} record)",
+        type="primary",
+        key="sales_confirm",
+    ):
+        with st.spinner("Import in corso…"):
+            # Riapplica mapping al momento del confirm (DB potrebbe essere cambiato)
+            mapped = apply_sales_entity_mapping(records)
+            delete_sales_period(p_anno, p_mese)
+            inserted = insert_sales_records(p_anno, p_mese, mapped)
+        st.success(
+            f"Import completato: {inserted} record per {MESI_LABEL[p_mese]} {p_anno}."
+        )
+        st.balloons()
+        st.session_state.sales_ready = False
+        st.session_state.pop("sales_records", None)
+        st.session_state.pop("sales_match_report", None)
+
+
+def page_dati_consulta() -> None:
+    st.subheader("Consulta dati di vendita")
+    st.caption(
+        "I dati sono organizzati per **microarea**. L’informatore indicato è quello "
+        "assegnato in quel mese (storico)."
+    )
+
+    filters = list_sales_filter_values()
+    if not filters["anni"] or not filters["periodi"]:
+        st.info("Nessun dato di vendita presente. Usa Importa per caricare un Excel.")
+        return
+
+    periodi = filters["periodi"]
+    period_labels = {_period_label(p): p for p in periodi}
+    label_list = list(period_labels.keys())
+
+    # ------------------------------------------------------------------
+    # Grafico andamento
+    # ------------------------------------------------------------------
+    st.markdown("##### Andamento nel tempo")
+
+    g1, g2, g3, g4 = st.columns([1.1, 1.3, 1.3, 1.3])
+    with g1:
+        chart_base = st.selectbox(
+            "Base",
+            options=["unita", "fatturato"],
+            format_func=lambda m: "Unità" if m == "unita" else "Fatturato",
+            key="chart_metrica",
+        )
+    with g2:
+        chart_valore = st.selectbox(
+            "Valore asse Y",
+            options=["vendita", "crescita_pct"],
+            format_func=lambda v: (
+                "Vendita"
+                if v == "vendita"
+                else "Crescita % su anno precedente"
+            ),
+            key="chart_valore",
+        )
+    with g3:
+        periodo_da = st.selectbox(
+            "Dal",
+            options=label_list,
+            index=0,
+            key="chart_periodo_da",
+        )
+    with g4:
+        periodo_a = st.selectbox(
+            "Al",
+            options=label_list,
+            index=len(label_list) - 1,
+            key="chart_periodo_a",
+        )
+
+    g5, g6 = st.columns([1, 2])
+    with g5:
+        chart_dim = st.radio(
+            "Confronta per",
+            options=["Informatore", "Microarea"],
+            horizontal=True,
+            key="chart_dimensione",
+        )
+    with g6:
+        if chart_dim == "Informatore":
+            default_inf = (
+                ["Stanzione Alessandra"]
+                if "Stanzione Alessandra" in filters["informatori"]
+                else filters["informatori"][:1]
+            )
+            chart_entities = st.multiselect(
+                "Informatori",
+                options=filters["informatori"],
+                default=default_inf,
+                key="chart_informatori",
+            )
+        else:
+            preferred_micro = ["MILANO 09", "MONZA BRIANZA 08"]
+            default_micro = [m for m in preferred_micro if m in filters["microaree"]]
+            if not default_micro:
+                default_micro = filters["microaree"][:1] if filters["microaree"] else []
+            chart_entities = st.multiselect(
+                "Microaree",
+                options=filters["microaree"],
+                default=default_micro,
+                key="chart_microaree",
+            )
+
+    default_prodotti = (
+        ["Totale selezione"]
+        if "Totale selezione" in filters["prodotti"]
+        else filters["prodotti"][:1]
+    )
+    chart_prodotti = st.multiselect(
+        "Prodotti",
+        options=filters["prodotti"],
+        default=default_prodotti,
+        key="chart_prodotti",
+    )
+
+    chart_area = st.empty()
+
+    c_it, c_am, _ = st.columns([1, 1, 2])
+    with c_it:
+        show_italia = st.checkbox("Mostra Totale Italia", key="chart_show_italia")
+    with c_am:
+        show_am = st.checkbox("Mostra Totale AM", key="chart_show_am")
+
+    if not chart_entities and not show_italia and not show_am:
+        chart_area.info(
+            "Seleziona almeno un informatore/microarea, oppure abilita Totale Italia / Totale AM."
+        )
+    elif not chart_prodotti:
+        chart_area.info("Seleziona almeno un prodotto per il grafico.")
+    else:
+        trend_df = fetch_sales_trend(
+            metrica=chart_base,
+            valore=chart_valore,
+            dimensione=chart_dim,
+            entities=chart_entities,
+            prodotti=chart_prodotti,
+            period_from=period_labels[periodo_da],
+            period_to=period_labels[periodo_a],
+            include_italia=show_italia,
+            include_am=show_am,
+        )
+        if trend_df.empty:
+            chart_area.warning("Nessun dato disponibile per i filtri del grafico.")
+        else:
+            if chart_valore == "crescita_pct":
+                y_title = (
+                    "Crescita % unità"
+                    if chart_base == "unita"
+                    else "Crescita % fatturato"
+                )
+                y_format = ",.2f"
+            else:
+                y_title = "Unità" if chart_base == "unita" else "Fatturato (€)"
+                y_format = ",.2f"
+            chart = (
+                alt.Chart(trend_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X(
+                        "periodo:T",
+                        title="Periodo",
+                        axis=alt.Axis(format="%b %Y"),
+                    ),
+                    y=alt.Y("valore:Q", title=y_title),
+                    color=alt.Color(
+                        "serie:N",
+                        title=None,
+                        legend=alt.Legend(
+                            orient="right",
+                            labelLimit=220,
+                            symbolLimit=40,
+                            columns=1,
+                            labelFontSize=12,
+                            symbolSize=80,
+                            padding=12,
+                            offset=16,
+                        ),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("periodo:T", title="Periodo", format="%b %Y"),
+                        alt.Tooltip("serie_full:N", title="Serie"),
+                        alt.Tooltip("valore:Q", title=y_title, format=y_format),
+                    ],
+                )
+                .properties(height=420)
+                .configure_view(strokeWidth=0)
+                .configure_legend(title=None)
+                .interactive()
+            )
+            chart_area.altair_chart(chart, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("##### Dettaglio tabellare")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        anno = st.selectbox("Anno", options=filters["anni"], key="q_sales_anno")
+    with c2:
+        mesi_opts = filters["mesi"] or list(range(1, 13))
+        mese = st.selectbox(
+            "Mese",
+            options=mesi_opts,
+            format_func=lambda m: MESI_LABEL.get(m, str(m)),
+            key="q_sales_mese",
+        )
+    with c3:
+        metrica = st.selectbox(
+            "Metrica tabella",
+            options=["Tutte", "unita", "fatturato"],
+            key="q_sales_metrica",
+        )
+    with c4:
+        livello_opts = ["microarea", "informatore", "am", "italia", "Tutti"]
+        livello = st.selectbox(
+            "Livello",
+            options=livello_opts,
+            key="q_sales_livello",
+        )
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        microarea = st.selectbox(
+            "Microarea",
+            options=["Tutte", *filters["microaree"]],
+            key="q_sales_micro",
+        )
+    with c6:
+        prodotto = st.selectbox(
+            "Prodotto",
+            options=["Tutti", *filters["prodotti"]],
+            key="q_sales_prodotto",
+        )
+    with c7:
+        informatore = st.selectbox(
+            "Informatore (nel periodo)",
+            options=["Tutti", *filters["informatori"]],
+            key="q_sales_inf",
+        )
+
+    df = search_sales(
+        anno=int(anno),
+        mese=int(mese),
+        metrica=metrica,
+        livello=livello,
+        prodotto=prodotto,
+        informatore=None if informatore == "Tutti" else informatore,
+        microarea=microarea,
+    )
+
+    st.caption(f"{len(df)} record trovati")
+    if df.empty:
+        st.info("Nessun risultato con i filtri selezionati.")
+        return
+
+    show = df[
+        [
+            "microarea",
+            "informatore",
+            "prodotto",
+            "metrica",
+            "livello",
+            "vendita_ap",
+            "vendita",
+            "pct_italia",
+            "crescita_pct",
+        ]
+    ].rename(
+        columns={
+            "microarea": "Microarea",
+            "informatore": "Informatore (periodo)",
+            "prodotto": "Prodotto",
+            "metrica": "Metrica",
+            "livello": "Livello",
+            "vendita_ap": "Vendita AP",
+            "vendita": "Vendita",
+            "pct_italia": "% Italia",
+            "crescita_pct": "Crescita %",
+        }
+    )
+
+    def _style_crescita(value: Any) -> str:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if num > 0:
+            return "color: #1b7f3a; font-weight: 600"
+        if num < 0:
+            return "color: #c62828; font-weight: 600"
+        return ""
+
+    styled = show.style.map(_style_crescita, subset=["Crescita %"])
+    st.dataframe(styled, width="stretch", hide_index=True)
+
+    csv_bytes = show.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Scarica CSV",
+        data=csv_bytes,
+        file_name=f"vendite_{anno}_{int(mese):02d}.csv",
+        mime="text/csv",
+    )
+
+
 def page_impostazioni() -> None:
     st.subheader("Impostazioni")
 
@@ -1235,25 +2227,47 @@ def main() -> None:
     with st.sidebar:
         st.markdown("### Doctorale")
         st.caption(f"Utente: **{st.session_state.get('username', '')}**")
-        pagina = st.radio(
-            "Menu",
-            options=["Elenco e ricerca", "Nuovo medico", "Importa", "Impostazioni"],
-            label_visibility="collapsed",
+
+        sezione = st.radio(
+            "Sezione",
+            options=["Medici", "Dati", "Impostazioni"],
+            key="nav_sezione",
         )
+
+        pagina_medici: Optional[str] = None
+        pagina_dati: Optional[str] = None
+        if sezione == "Medici":
+            pagina_medici = st.radio(
+                "Funzioni medici",
+                options=["Elenco e ricerca", "Nuovo medico", "Importa"],
+                key="nav_medici",
+            )
+        elif sezione == "Dati":
+            pagina_dati = st.radio(
+                "Funzioni dati",
+                options=["Consulta", "Importa"],
+                key="nav_dati",
+            )
+
         st.markdown("---")
         if st.button("Esci", width="stretch"):
             st.session_state.authenticated = False
             st.session_state.pop("username", None)
             st.rerun()
 
-    if pagina == "Elenco e ricerca":
-        page_elenco()
-    elif pagina == "Nuovo medico":
+    if sezione == "Impostazioni":
+        page_impostazioni()
+    elif sezione == "Dati":
+        if pagina_dati == "Importa":
+            page_dati_importa()
+        else:
+            page_dati_consulta()
+    elif pagina_medici == "Nuovo medico":
         page_nuovo()
-    elif pagina == "Importa":
+    elif pagina_medici == "Importa":
         page_importa()
     else:
-        page_impostazioni()
+        page_elenco()
 
 
 if __name__ == "__main__":
