@@ -121,6 +121,7 @@ def list_invoices(year: Optional[int] = None) -> pd.DataFrame:
             i.kind,
             i.issue_date,
             i.payment_date,
+            i.series_year,
             i.reference_year,
             i.reference_month,
             i.notes,
@@ -136,7 +137,7 @@ def list_invoices(year: Optional[int] = None) -> pd.DataFrame:
         params.append(year)
     sql += """
         GROUP BY i.id
-        ORDER BY i.reference_year DESC, i.number ASC
+        ORDER BY i.reference_year DESC, i.reference_month DESC, i.number ASC
     """
     return _read_df(sql, params or None)
 
@@ -169,6 +170,7 @@ def update_invoice(invoice_id: int, data: dict[str, Any]) -> None:
                     kind = %(kind)s,
                     issue_date = %(issue_date)s,
                     payment_date = %(payment_date)s,
+                    series_year = %(series_year)s,
                     reference_year = %(reference_year)s,
                     reference_month = %(reference_month)s,
                     notes = %(notes)s,
@@ -405,16 +407,23 @@ def page_elenco_fatture() -> None:
 
     display = pd.DataFrame(
         {
-            "N.": df["number"],
+            "N.": df.apply(
+                lambda r: f"{int(r['series_year'])}-{int(r['number']):02d}"
+                if "series_year" in df.columns and pd.notna(r.get("series_year"))
+                else f"{int(r['number']):02d}",
+                axis=1,
+            ),
             "Tipo": df["kind"].map(INVOICE_KIND_LABELS),
             "Competenza": df.apply(
-                lambda r: f"{_month_label(r['reference_month'])} {int(r['reference_year'])}",
+                lambda r: date(
+                    int(r["reference_year"]), int(r["reference_month"]), 1
+                ),
                 axis=1,
             ),
             "Emissione": df["issue_date"],
             "Pagamento": df["payment_date"],
-            "Legacy": df["legacy_amount"].map(_fmt_euro),
-            "Totale righe": df["lines_total"].map(_fmt_euro),
+            "Legacy": pd.to_numeric(df["legacy_amount"], errors="coerce"),
+            "Totale righe": pd.to_numeric(df["lines_total"], errors="coerce"),
             "Righe": df["lines_count"].astype(int),
         }
     )
@@ -424,6 +433,22 @@ def page_elenco_fatture() -> None:
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
+        column_config={
+            "Competenza": st.column_config.DateColumn(
+                "Competenza",
+                format="MMM YYYY",
+            ),
+            "Emissione": st.column_config.DateColumn("Emissione"),
+            "Pagamento": st.column_config.DateColumn("Pagamento"),
+            "Legacy": st.column_config.NumberColumn(
+                "Legacy",
+                format="€ %.2f",
+            ),
+            "Totale righe": st.column_config.NumberColumn(
+                "Totale righe",
+                format="€ %.2f",
+            ),
+        },
         key="fin_inv_table",
     )
 
@@ -440,13 +465,21 @@ def page_elenco_fatture() -> None:
 
     st.markdown("---")
     st.markdown(
-        f"##### Fattura n. {inv['number']} · "
+        f"##### Fattura {inv.get('series_year', inv['reference_year'])}-{int(inv['number']):02d} · "
         f"{INVOICE_KIND_LABELS.get(inv['kind'], inv['kind'])} · "
         f"{_month_label(inv['reference_month'])} {inv['reference_year']}"
     )
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
+        series_year = st.number_input(
+            "Anno numerazione",
+            min_value=2000,
+            max_value=2100,
+            step=1,
+            value=int(inv.get("series_year") or inv["reference_year"]),
+            key=f"inv_series_{invoice_id}",
+        )
         number = st.number_input(
             "Numero",
             min_value=1,
@@ -514,6 +547,7 @@ def page_elenco_fatture() -> None:
                 "kind": kind,
                 "issue_date": issue_date,
                 "payment_date": payment_date,
+                "series_year": int(series_year),
                 "reference_year": int(ref_year),
                 "reference_month": int(ref_month),
                 "notes": notes or "",

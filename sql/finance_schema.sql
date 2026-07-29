@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS invoices (
     kind TEXT NOT NULL CHECK (kind IN ('advance', 'balance')),
     issue_date DATE,
     payment_date DATE,
+    -- Anno della numerazione (es. fattura 2026/2), distinto dalla competenza
+    series_year INTEGER NOT NULL,
     reference_year INTEGER NOT NULL,
     reference_month INTEGER NOT NULL CHECK (reference_month BETWEEN 1 AND 12),
     notes TEXT NOT NULL DEFAULT '',
@@ -41,7 +43,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     firebase_id TEXT UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (reference_year, number)
+    UNIQUE (series_year, number)
 );
 
 CREATE TABLE IF NOT EXISTS invoice_lines (

@@ -146,19 +146,26 @@ def year_month_from_period_id(doc_id: str, ref_field: Any) -> tuple[int, int]:
     raise ValueError(f"Impossibile determinare anno/mese per doc {doc_id!r}")
 
 
-def invoice_period(doc_id: str, ref_field: Any) -> tuple[int, int]:
-    """
-    Per invoices: id è YYYY-<numero sequenziale>, NON anno-mese.
-    Il mese di competenza viene da referenceMonth (timestamp).
-    """
+def invoice_period(ref_field: Any) -> tuple[int, int]:
+    """Anno/mese di competenza: solo da referenceMonth (timestamp)."""
     ym = year_month_from_ts(ref_field)
     if not ym:
-        raise ValueError(f"Impossibile determinare mese fattura per doc {doc_id!r}")
-    ref_y, ref_m = ym
+        raise ValueError("Impossibile determinare mese di competenza da referenceMonth")
+    return ym
+
+
+def invoice_series_year(doc_id: str, issue_date_field: Any) -> int:
+    """
+    Anno della numerazione fattura (id Firebase YYYY-NN oppure anno emissione).
+    Può differire dall'anno di competenza (es. saldo nov 2025 emesso a gen 2026).
+    """
     m = re.match(r"^(\d{4})-", doc_id)
     if m:
-        ref_y = int(m.group(1))
-    return ref_y, ref_m
+        return int(m.group(1))
+    d = to_date(issue_date_field)
+    if d:
+        return d.year
+    raise ValueError(f"Impossibile determinare series_year per doc {doc_id!r}")
 
 
 def money(value: Any) -> Decimal:
@@ -248,7 +255,8 @@ def migrate_year_quotas(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int
 def migrate_invoices(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int:
     n = 0
     for doc_id, data in rows:
-        ref_y, ref_m = invoice_period(doc_id, data.get("referenceMonth"))
+        ref_y, ref_m = invoice_period(data.get("referenceMonth"))
+        series_year = invoice_series_year(doc_id, data.get("issueDate"))
         is_advance = bool(data.get("isAdvance"))
         kind = "advance" if is_advance else "balance"
         payload = {
@@ -256,6 +264,7 @@ def migrate_invoices(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int:
             "kind": kind,
             "issue_date": to_date(data.get("issueDate")),
             "payment_date": to_date(data.get("paymentDate")),
+            "series_year": series_year,
             "reference_year": ref_y,
             "reference_month": ref_m,
             "notes": "",
@@ -264,17 +273,18 @@ def migrate_invoices(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int:
         }
         print(
             f"  invoice {doc_id} → n={payload['number']} {kind} "
-            f"{ref_y}-{ref_m:02d} legacy={payload['legacy_amount']}"
+            f"serie={series_year} competenza={ref_y}-{ref_m:02d} "
+            f"legacy={payload['legacy_amount']}"
         )
         if not dry_run:
             cur.execute(
                 """
                 INSERT INTO invoices (
-                    number, kind, issue_date, payment_date,
+                    number, kind, issue_date, payment_date, series_year,
                     reference_year, reference_month, notes, legacy_amount,
                     firebase_id, updated_at
                 ) VALUES (
-                    %(number)s, %(kind)s, %(issue_date)s, %(payment_date)s,
+                    %(number)s, %(kind)s, %(issue_date)s, %(payment_date)s, %(series_year)s,
                     %(reference_year)s, %(reference_month)s, %(notes)s, %(legacy_amount)s,
                     %(firebase_id)s, NOW()
                 )
@@ -283,6 +293,7 @@ def migrate_invoices(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int:
                     kind = EXCLUDED.kind,
                     issue_date = EXCLUDED.issue_date,
                     payment_date = EXCLUDED.payment_date,
+                    series_year = EXCLUDED.series_year,
                     reference_year = EXCLUDED.reference_year,
                     reference_month = EXCLUDED.reference_month,
                     legacy_amount = EXCLUDED.legacy_amount,
