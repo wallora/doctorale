@@ -30,6 +30,12 @@ from sales_parser import (
     parse_sales_workbook,
     suggest_sheets,
 )
+from finance_pages import (
+    page_elenco_fatture,
+    page_elenco_pagamenti,
+    page_elenco_prelievi,
+    page_quote_annuali,
+)
 
 # ---------------------------------------------------------------------------
 # Configurazione
@@ -2230,12 +2236,13 @@ def main() -> None:
 
         sezione = st.radio(
             "Sezione",
-            options=["Medici", "Dati", "Impostazioni"],
+            options=["Medici", "Dati", "Contabilità", "Impostazioni"],
             key="nav_sezione",
         )
 
         pagina_medici: Optional[str] = None
         pagina_dati: Optional[str] = None
+        pagina_contab: Optional[str] = None
         if sezione == "Medici":
             pagina_medici = st.radio(
                 "Funzioni medici",
@@ -2248,6 +2255,17 @@ def main() -> None:
                 options=["Consulta", "Importa"],
                 key="nav_dati",
             )
+        elif sezione == "Contabilità":
+            pagina_contab = st.radio(
+                "Funzioni contabilità",
+                options=[
+                    "Elenco Fatture",
+                    "Elenco pagamenti",
+                    "Elenco prelievi",
+                    "Quote annuali",
+                ],
+                key="nav_contab",
+            )
 
         st.markdown("---")
         if st.button("Esci", width="stretch"):
@@ -2257,6 +2275,15 @@ def main() -> None:
 
     if sezione == "Impostazioni":
         page_impostazioni()
+    elif sezione == "Contabilità":
+        if pagina_contab == "Elenco pagamenti":
+            page_elenco_pagamenti()
+        elif pagina_contab == "Elenco prelievi":
+            page_elenco_prelievi()
+        elif pagina_contab == "Quote annuali":
+            page_quote_annuali()
+        else:
+            page_elenco_fatture()
     elif sezione == "Dati":
         if pagina_dati == "Importa":
             page_dati_importa()
