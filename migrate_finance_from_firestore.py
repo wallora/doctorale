@@ -52,6 +52,7 @@ TAX_TYPES = {
     "bolloFatture",
     "cameraCommercio",
     "incomeTax",
+    "strumenti",
 }
 
 YEAR_ID_RE = re.compile(r"^(\d{4})$")

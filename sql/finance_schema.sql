@@ -8,7 +8,7 @@
 -- invoice_lines.line_type:
 --   commissions | direct_sale | bonuses | enasarco | advance_deduction | other
 -- tax_payments.type:
---   inps | bankAccount | bolloFatture | cameraCommercio | incomeTax
+--   inps | bankAccount | bolloFatture | cameraCommercio | incomeTax | strumenti
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS year_quotas (
@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS tax_payments (
             'bankAccount',
             'bolloFatture',
             'cameraCommercio',
-            'incomeTax'
+            'incomeTax',
+            'strumenti'
         )
     ),
     description TEXT NOT NULL DEFAULT '',

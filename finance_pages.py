@@ -36,6 +36,7 @@ TAX_TYPE_LABELS = {
     "bolloFatture": "Bollo fatture",
     "cameraCommercio": "Camera di commercio",
     "incomeTax": "Imposte sul reddito",
+    "strumenti": "Strumenti",
 }
 TAX_TYPE_OPTIONS = list(TAX_TYPE_LABELS.keys())
 
