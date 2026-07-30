@@ -35,6 +35,7 @@ from finance_pages import (
     page_elenco_pagamenti,
     page_elenco_prelievi,
     page_quote_annuali,
+    page_contabilita_mensile,
 )
 
 # ---------------------------------------------------------------------------
@@ -2259,6 +2260,7 @@ def main() -> None:
             pagina_contab = st.radio(
                 "Funzioni contabilità",
                 options=[
+                    "Contabilità mensile",
                     "Elenco Fatture",
                     "Elenco pagamenti",
                     "Elenco prelievi",
@@ -2282,8 +2284,10 @@ def main() -> None:
             page_elenco_prelievi()
         elif pagina_contab == "Quote annuali":
             page_quote_annuali()
-        else:
+        elif pagina_contab == "Elenco Fatture":
             page_elenco_fatture()
+        else:
+            page_contabilita_mensile()
     elif sezione == "Dati":
         if pagina_dati == "Importa":
             page_dati_importa()

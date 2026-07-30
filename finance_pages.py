@@ -13,6 +13,12 @@ import psycopg2.extras
 import streamlit as st
 
 from sales_parser import MESI_LABEL
+from finance_calc import (
+    Quotas,
+    annual_taxes,
+    attribution_year,
+    breakdown_from_lordo,
+)
 
 INVOICE_KIND_LABELS = {
     "advance": "Acconto",
@@ -419,6 +425,100 @@ def delete_withdrawal(withdrawal_id: int) -> None:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM withdrawals WHERE id = %s", (withdrawal_id,))
+
+
+def list_competence_periods() -> list[tuple[int, int]]:
+    sql = """
+        SELECT DISTINCT reference_year, reference_month
+        FROM invoices
+        ORDER BY reference_year DESC, reference_month DESC
+    """
+    df = _read_df(sql)
+    if df.empty:
+        return []
+    return [
+        (int(r.reference_year), int(r.reference_month))
+        for r in df.itertuples(index=False)
+    ]
+
+
+def list_invoices_for_competence(year: int, month: int) -> pd.DataFrame:
+    sql = """
+        SELECT
+            i.id,
+            i.number,
+            i.kind,
+            i.issue_date,
+            i.payment_date,
+            i.series_year,
+            i.reference_year,
+            i.reference_month,
+            COALESCE(SUM(l.amount), 0) AS lines_total
+        FROM invoices i
+        LEFT JOIN invoice_lines l ON l.invoice_id = i.id
+        WHERE i.reference_year = %s AND i.reference_month = %s
+        GROUP BY i.id
+        ORDER BY i.kind ASC, i.number ASC
+    """
+    return _read_df(sql, [year, month])
+
+
+def list_enasarco_lines_for_competence(year: int, month: int) -> pd.DataFrame:
+    """Voci enasarco sulle fatture di saldo del mese di competenza."""
+    sql = """
+        SELECT
+            i.id AS invoice_id,
+            i.series_year,
+            i.number,
+            l.description,
+            l.amount
+        FROM invoices i
+        JOIN invoice_lines l ON l.invoice_id = i.id
+        WHERE i.reference_year = %s
+          AND i.reference_month = %s
+          AND i.kind = 'balance'
+          AND l.line_type = 'enasarco'
+        ORDER BY i.number, l.sort_order, l.id
+    """
+    return _read_df(sql, [year, month])
+
+
+def list_withdrawals_for_month(year: int, month: int) -> pd.DataFrame:
+    sql = """
+        SELECT id, withdrawal_date, reference_year, reference_month,
+               amount, description
+        FROM withdrawals
+        WHERE reference_year = %s AND reference_month = %s
+        ORDER BY withdrawal_date NULLS LAST, id
+    """
+    return _read_df(sql, [year, month])
+
+
+def fatturato_by_attribution_year() -> dict[int, float]:
+    """
+    Fatturato annuale = somma totale righe, aggregato per anno di
+    pagamento (se presente) altrimenti emissione.
+    """
+    sql = """
+        SELECT
+            EXTRACT(
+                YEAR FROM COALESCE(i.payment_date, i.issue_date)
+            )::INTEGER AS attr_year,
+            COALESCE(SUM(l.amount), 0) AS fatturato
+        FROM invoices i
+        LEFT JOIN invoice_lines l ON l.invoice_id = i.id
+        WHERE COALESCE(i.payment_date, i.issue_date) IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1
+    """
+    df = _read_df(sql)
+    if df.empty:
+        return {}
+    return {
+        int(r.attr_year): float(r.fatturato)
+        for r in df.itertuples(index=False)
+        if r.attr_year is not None
+    }
 
 
 def list_year_quotas() -> pd.DataFrame:
@@ -1109,3 +1209,315 @@ def page_quote_annuali() -> None:
         upsert_year_quota(int(year_input), values)
         st.success(f"Quote {int(year_input)} salvate.")
         st.rerun()
+
+
+def _quotas_or_none(year: Optional[int]) -> Optional[Quotas]:
+    if year is None:
+        return None
+    row = get_year_quota(year)
+    if not row:
+        return None
+    return Quotas.from_row(row)
+
+
+def page_contabilita_mensile() -> None:
+    st.subheader("Contabilità mensile")
+    st.caption(
+        "Netto prelevabile del mese di competenza: lordo (totale righe) "
+        "meno INPS e imposta sul reddito di competenza, meno i prelievi. "
+        "L'enasarco è già nel lordo se presente tra le voci."
+    )
+
+    periods = list_competence_periods()
+    if not periods:
+        st.info("Nessuna fattura con mese di competenza.")
+        return
+
+    labels = [f"{_month_label(m)} {y}" for y, m in periods]
+    choice = st.selectbox("Mese di competenza", options=labels, key="fin_month_period")
+    year, month = periods[labels.index(choice)]
+
+    invoices = list_invoices_for_competence(year, month)
+    enasarco_df = list_enasarco_lines_for_competence(year, month)
+    withdrawals_df = list_withdrawals_for_month(year, month)
+    fatturato_anni = fatturato_by_attribution_year()
+
+    # --- Fatture del mese ---
+    st.markdown("##### Fatture del mese")
+    if invoices.empty:
+        st.info("Nessuna fattura in questo mese.")
+        return
+
+    inv_rows = []
+    total_lordo = 0.0
+    total_esente = 0.0
+    total_inps = 0.0
+    total_ir = 0.0
+    total_imponibile_ir = 0.0
+    missing_quotas: set[int] = set()
+    attr_years_used: set[int] = set()
+
+    for r in invoices.itertuples(index=False):
+        issue = r.issue_date
+        pay = r.payment_date
+        attr = attribution_year(issue, pay)
+        quotas = _quotas_or_none(attr)
+        lordo = float(r.lines_total)
+        if quotas is None:
+            if attr is not None:
+                missing_quotas.add(attr)
+            bd_esente = bd_inps = bd_ir = bd_imp_ir = 0.0
+            note = f"Quote mancanti per {attr}" if attr else "Senza data emissione/pagamento"
+        else:
+            bd = breakdown_from_lordo(lordo, quotas)
+            bd_esente = bd.esente
+            bd_inps = bd.inps_dovuto
+            bd_ir = bd.imposta_reddito
+            bd_imp_ir = bd.imponibile_reddito
+            note = f"Quote {attr}"
+            attr_years_used.add(int(attr))
+            total_esente += bd_esente
+            total_inps += bd_inps
+            total_ir += bd_ir
+            total_imponibile_ir += bd_imp_ir
+
+        total_lordo += lordo
+        inv_rows.append(
+            {
+                "N.": f"{int(r.series_year)}-{int(r.number):02d}",
+                "Tipo": INVOICE_KIND_LABELS.get(r.kind, r.kind),
+                "Emissione": issue,
+                "Pagamento": pay,
+                "Lordo": lordo,
+                "Esente": bd_esente,
+                "INPS": bd_inps,
+                "Imposta reddito": bd_ir,
+                "Note": note,
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(inv_rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Emissione": st.column_config.DateColumn("Emissione"),
+            "Pagamento": st.column_config.DateColumn("Pagamento"),
+            "Lordo": st.column_config.NumberColumn("Lordo", format="€ %.2f"),
+            "Esente": st.column_config.NumberColumn("Esente", format="€ %.2f"),
+            "INPS": st.column_config.NumberColumn("INPS", format="€ %.2f"),
+            "Imposta reddito": st.column_config.NumberColumn(
+                "Imposta reddito", format="€ %.2f"
+            ),
+        },
+        key=f"fin_month_inv_{year}_{month}",
+    )
+    if missing_quotas:
+        st.warning(
+            "Mancano le quote annuali per: "
+            + ", ".join(str(y) for y in sorted(missing_quotas))
+        )
+
+    # --- Tributi / enasarco ---
+    st.markdown("##### Tributi del mese")
+    enasarco_total = (
+        float(pd.to_numeric(enasarco_df["amount"], errors="coerce").fillna(0).sum())
+        if not enasarco_df.empty
+        else 0.0
+    )
+
+    trib_rows = [
+        {
+            "Voce": "INPS (competenza mese)",
+            "Importo": total_inps,
+            "Dettaglio": "Su imponibile post-esente, con sconto INPS",
+        },
+        {
+            "Voce": "Imposta sul reddito (competenza mese)",
+            "Importo": total_ir,
+            "Dettaglio": f"Imponibile reddito {_fmt_euro(total_imponibile_ir)}",
+        },
+        {
+            "Voce": "Enasarco (voci fattura di saldo)",
+            "Importo": enasarco_total,
+            "Dettaglio": "Già compreso nel lordo (di solito negativo)",
+        },
+    ]
+    st.dataframe(
+        pd.DataFrame(trib_rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Importo": st.column_config.NumberColumn("Importo", format="€ %.2f"),
+        },
+        key=f"fin_month_trib_{year}_{month}",
+    )
+
+    if not enasarco_df.empty:
+        with st.expander("Dettaglio enasarco fattura di saldo", expanded=False):
+            show_e = pd.DataFrame(
+                {
+                    "Fattura": enasarco_df.apply(
+                        lambda r: f"{int(r['series_year'])}-{int(r['number']):02d}",
+                        axis=1,
+                    ),
+                    "Descrizione": enasarco_df["description"],
+                    "Importo": pd.to_numeric(enasarco_df["amount"], errors="coerce"),
+                }
+            )
+            st.dataframe(
+                show_e,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Importo": st.column_config.NumberColumn(
+                        "Importo", format="€ %.2f"
+                    ),
+                },
+                key=f"fin_month_enasarco_{year}_{month}",
+            )
+
+    # Contesto annuale (saldo surplus + acconto)
+    if attr_years_used:
+        with st.expander("Contesto tasse annuali (saldo su surplus + acconto)", expanded=False):
+            for ay in sorted(attr_years_used):
+                quotas = _quotas_or_none(ay)
+                if quotas is None:
+                    st.caption(f"Anno {ay}: quote mancanti.")
+                    continue
+                fat = fatturato_anni.get(ay, 0.0)
+                fat_prev = fatturato_anni.get(ay - 1, 0.0)
+                ann = annual_taxes(ay, fat, fat_prev, quotas)
+                st.markdown(f"**Anno {ay}** (quote {ay})")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Fatturato", _fmt_euro(ann.fatturato))
+                c2.metric("Anno precedente", _fmt_euro(ann.fatturato_prev))
+                c3.metric("Surplus", _fmt_euro(ann.surplus))
+                st.caption(
+                    f"INPS saldo {_fmt_euro(ann.inps_saldo)} + acconto "
+                    f"{_fmt_euro(ann.inps_acconto)} = **{_fmt_euro(ann.inps_totale)}** · "
+                    f"IR saldo {_fmt_euro(ann.ir_saldo)} + acconto "
+                    f"{_fmt_euro(ann.ir_acconto)} = **{_fmt_euro(ann.ir_totale)}**"
+                )
+
+    # --- Prelievi ---
+    st.markdown("##### Prelievi del mese")
+    wd_total = 0.0
+    if withdrawals_df.empty:
+        st.info("Nessun prelievo in questo mese.")
+        selected: list[int] = []
+        df_wd = withdrawals_df
+    else:
+        df_wd = withdrawals_df
+        wd_total = float(
+            pd.to_numeric(df_wd["amount"], errors="coerce").fillna(0).sum()
+        )
+        display_wd = pd.DataFrame(
+            {
+                "Data": df_wd["withdrawal_date"],
+                "Importo": pd.to_numeric(df_wd["amount"], errors="coerce"),
+                "Descrizione": df_wd["description"],
+            }
+        )
+        event = st.dataframe(
+            display_wd,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            column_config={
+                "Data": st.column_config.DateColumn("Data"),
+                "Importo": st.column_config.NumberColumn("Importo", format="€ %.2f"),
+            },
+            key=f"fin_month_wd_table_{year}_{month}",
+        )
+        selected = event.selection.rows if event and event.selection else []
+        st.caption(f"Totale prelievi: **{_fmt_euro(wd_total)}**")
+
+    st.markdown("---")
+    withdrawal: Optional[dict[str, Any]] = None
+    withdrawal_id: Optional[int] = None
+    if selected and not df_wd.empty:
+        withdrawal_id = int(df_wd.iloc[selected[0]]["id"])
+        withdrawal = get_withdrawal(withdrawal_id)
+        st.markdown("##### Modifica prelievo")
+    else:
+        st.markdown("##### Nuovo prelievo per questo mese")
+
+    defaults = withdrawal or {
+        "withdrawal_date": date(year, month, 1),
+        "reference_year": year,
+        "reference_month": month,
+        "amount": 0.0,
+        "description": "",
+    }
+
+    d1, d2 = st.columns(2)
+    with d1:
+        withdrawal_date = st.date_input(
+            "Data prelievo",
+            value=defaults.get("withdrawal_date") or date(year, month, 1),
+            key=f"mwd_date_{year}_{month}_{withdrawal_id or 'new'}",
+        )
+    with d2:
+        amount = st.number_input(
+            "Importo (€)",
+            value=_money(defaults.get("amount")),
+            step=0.01,
+            format="%.2f",
+            key=f"mwd_amt_{year}_{month}_{withdrawal_id or 'new'}",
+        )
+    description = st.text_input(
+        "Descrizione",
+        value=defaults.get("description") or "",
+        key=f"mwd_desc_{year}_{month}_{withdrawal_id or 'new'}",
+    )
+
+    b1, b2, _ = st.columns([1, 1, 2])
+    with b1:
+        if st.button(
+            "Salva prelievo",
+            type="primary",
+            key=f"mwd_save_{year}_{month}_{withdrawal_id or 'new'}",
+        ):
+            upsert_withdrawal(
+                {
+                    "withdrawal_date": withdrawal_date,
+                    "reference_year": year,
+                    "reference_month": month,
+                    "amount": float(amount),
+                    "description": description or "",
+                },
+                withdrawal_id=withdrawal_id,
+            )
+            st.success("Prelievo salvato.")
+            st.rerun()
+    with b2:
+        if withdrawal_id is not None:
+            confirm = st.checkbox(
+                "Conferma eliminazione",
+                key=f"mwd_del_confirm_{year}_{month}_{withdrawal_id}",
+            )
+            if st.button(
+                "Elimina",
+                disabled=not confirm,
+                key=f"mwd_del_{year}_{month}_{withdrawal_id}",
+            ):
+                delete_withdrawal(withdrawal_id)
+                st.success("Prelievo eliminato.")
+                st.rerun()
+
+    # --- Riepilogo netto ---
+    st.markdown("---")
+    st.markdown("##### Riepilogo netto mese")
+    netto = total_lordo - total_inps - total_ir - wd_total
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Lordo", _fmt_euro(total_lordo))
+    r2.metric("di cui esente", _fmt_euro(total_esente))
+    r3.metric("INPS + IR", _fmt_euro(total_inps + total_ir))
+    r4.metric("Prelievi", _fmt_euro(wd_total))
+    r5.metric("Netto residuo", _fmt_euro(netto))
+    st.caption(
+        "Netto residuo = lordo − INPS − imposta reddito − prelievi. "
+        "Se positivo, è la cifra ancora prelevabile senza andare in rosso sul mese."
+    )
