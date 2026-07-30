@@ -113,7 +113,73 @@ def list_distinct_years() -> list[int]:
     return sorted(years, reverse=True)
 
 
-def list_invoices(year: Optional[int] = None) -> pd.DataFrame:
+def list_invoice_year_options() -> dict[str, list[int]]:
+    """Anni disponibili per i filtri fatture."""
+    out: dict[str, list[int]] = {
+        "reference": [],
+        "issue": [],
+        "payment": [],
+    }
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT reference_year
+                FROM invoices
+                WHERE reference_year IS NOT NULL
+                ORDER BY 1 DESC
+                """
+            )
+            out["reference"] = [int(r[0]) for r in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT DISTINCT EXTRACT(YEAR FROM issue_date)::INTEGER
+                FROM invoices
+                WHERE issue_date IS NOT NULL
+                ORDER BY 1 DESC
+                """
+            )
+            out["issue"] = [int(r[0]) for r in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT DISTINCT EXTRACT(YEAR FROM payment_date)::INTEGER
+                FROM invoices
+                WHERE payment_date IS NOT NULL
+                ORDER BY 1 DESC
+                """
+            )
+            out["payment"] = [int(r[0]) for r in cur.fetchall()]
+    return out
+
+
+def invoice_lines_total_bounds() -> tuple[float, float]:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(MIN(t.total), 0),
+                    COALESCE(MAX(t.total), 0)
+                FROM (
+                    SELECT COALESCE(SUM(l.amount), 0) AS total
+                    FROM invoices i
+                    LEFT JOIN invoice_lines l ON l.invoice_id = i.id
+                    GROUP BY i.id
+                ) t
+                """
+            )
+            row = cur.fetchone()
+            return float(row[0]), float(row[1])
+
+
+def list_invoices(
+    reference_year: Optional[int] = None,
+    issue_year: Optional[int] = None,
+    payment_year: Optional[int] = None,
+    kind: Optional[str] = None,
+    lines_total_min: Optional[float] = None,
+    lines_total_max: Optional[float] = None,
+) -> pd.DataFrame:
     sql = """
         SELECT
             i.id,
@@ -131,15 +197,39 @@ def list_invoices(year: Optional[int] = None) -> pd.DataFrame:
         FROM invoices i
         LEFT JOIN invoice_lines l ON l.invoice_id = i.id
     """
+    where: list[str] = []
     params: list[Any] = []
-    if year is not None:
-        sql += " WHERE i.reference_year = %s"
-        params.append(year)
+    if reference_year is not None:
+        where.append("i.reference_year = %s")
+        params.append(reference_year)
+    if issue_year is not None:
+        where.append("EXTRACT(YEAR FROM i.issue_date) = %s")
+        params.append(issue_year)
+    if payment_year is not None:
+        where.append("EXTRACT(YEAR FROM i.payment_date) = %s")
+        params.append(payment_year)
+    if kind is not None:
+        where.append("i.kind = %s")
+        params.append(kind)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " GROUP BY i.id"
+
+    having: list[str] = []
+    if lines_total_min is not None:
+        having.append("COALESCE(SUM(l.amount), 0) >= %s")
+        params.append(lines_total_min)
+    if lines_total_max is not None:
+        having.append("COALESCE(SUM(l.amount), 0) <= %s")
+        params.append(lines_total_max)
+    if having:
+        sql += " HAVING " + " AND ".join(having)
+
     sql += """
-        GROUP BY i.id
         ORDER BY i.reference_year DESC, i.reference_month DESC, i.number ASC
     """
     return _read_df(sql, params or None)
+
 
 
 def get_invoice(invoice_id: int) -> Optional[dict[str, Any]]:
@@ -394,15 +484,77 @@ def _year_filter(key: str, include_all: bool = True) -> Optional[int]:
     return int(choice)
 
 
+def _optional_year_select(
+    label: str, years: list[int], key: str
+) -> Optional[int]:
+    options = ["Tutti"] + [str(y) for y in years] if years else ["Tutti"]
+    choice = st.selectbox(label, options=options, key=key)
+    if choice == "Tutti":
+        return None
+    return int(choice)
+
+
 def page_elenco_fatture() -> None:
     st.subheader("Elenco fatture")
 
-    year = _year_filter("fin_inv_year")
-    df = list_invoices(year)
+    year_opts = list_invoice_year_options()
+    total_lo, total_hi = invoice_lines_total_bounds()
+    # Arrotonda i bound del range per lo slider
+    slider_min = float(int(total_lo) - (0 if total_lo >= 0 else 1))
+    slider_max = float(int(total_hi) + 1)
+    if slider_max <= slider_min:
+        slider_max = slider_min + 1.0
+
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        reference_year = _optional_year_select(
+            "Anno competenza", year_opts["reference"], "fin_inv_ref_year"
+        )
+    with f2:
+        issue_year = _optional_year_select(
+            "Anno emissione", year_opts["issue"], "fin_inv_issue_year"
+        )
+    with f3:
+        payment_year = _optional_year_select(
+            "Anno pagamento", year_opts["payment"], "fin_inv_pay_year"
+        )
+    with f4:
+        kind_label = st.selectbox(
+            "Tipo",
+            options=["Tutti", "Acconto", "Saldo"],
+            key="fin_inv_kind",
+        )
+    kind = None
+    if kind_label == "Acconto":
+        kind = "advance"
+    elif kind_label == "Saldo":
+        kind = "balance"
+
+    amount_range = st.slider(
+        "Totale righe (€)",
+        min_value=slider_min,
+        max_value=slider_max,
+        value=(slider_min, slider_max),
+        step=1.0,
+        key="fin_inv_amount_range",
+    )
+    lines_min, lines_max = float(amount_range[0]), float(amount_range[1])
+    # Se lo slider è al massimo range, non filtrare (evita tagli per arrotondamenti)
+    use_min = lines_min > slider_min + 1e-9
+    use_max = lines_max < slider_max - 1e-9
+
+    df = list_invoices(
+        reference_year=reference_year,
+        issue_year=issue_year,
+        payment_year=payment_year,
+        kind=kind,
+        lines_total_min=lines_min if use_min else None,
+        lines_total_max=lines_max if use_max else None,
+    )
     st.caption(f"{len(df)} fattur{'a' if len(df) == 1 else 'e'}")
 
     if df.empty:
-        st.info("Nessuna fattura trovata.")
+        st.info("Nessuna fattura corrisponde ai filtri.")
         return
 
     display = pd.DataFrame(
