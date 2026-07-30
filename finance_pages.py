@@ -496,15 +496,21 @@ def list_withdrawals_for_month(year: int, month: int) -> pd.DataFrame:
 
 def fatturato_by_attribution_year() -> dict[int, float]:
     """
-    Fatturato annuale = somma totale righe, aggregato per anno di
-    pagamento (se presente) altrimenti emissione.
+    Fatturato annuale = somma delle voci di fattura escluse le righe enasarco
+    (incassato lordo, senza sottrarre enasarco), aggregato per anno di
+    pagamento se presente, altrimenti anno di emissione (previsione tasse).
     """
     sql = """
         SELECT
             EXTRACT(
                 YEAR FROM COALESCE(i.payment_date, i.issue_date)
             )::INTEGER AS attr_year,
-            COALESCE(SUM(l.amount), 0) AS fatturato
+            COALESCE(
+                SUM(l.amount) FILTER (
+                    WHERE l.line_type IS DISTINCT FROM 'enasarco'
+                ),
+                0
+            ) AS fatturato
         FROM invoices i
         LEFT JOIN invoice_lines l ON l.invoice_id = i.id
         WHERE COALESCE(i.payment_date, i.issue_date) IS NOT NULL
@@ -1380,6 +1386,10 @@ def page_contabilita_mensile() -> None:
     # Contesto annuale (saldo surplus + acconto)
     if attr_years_used:
         with st.expander("Contesto tasse annuali (saldo su surplus + acconto)", expanded=False):
+            st.caption(
+                "Fatturato = voci di fattura senza enasarco, per anno di "
+                "pagamento (se c’è) oppure emissione."
+            )
             for ay in sorted(attr_years_used):
                 quotas = _quotas_or_none(ay)
                 if quotas is None:
