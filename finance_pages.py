@@ -1223,9 +1223,21 @@ def page_quote_annuali() -> None:
         st.rerun()
 
 
-def _quotas_or_none(year: Optional[int]) -> Optional[Quotas]:
+def _load_quotas_map() -> dict[int, Quotas]:
+    df = list_year_quotas()
+    if df.empty:
+        return {}
+    out: dict[int, Quotas] = {}
+    for _, row in df.iterrows():
+        out[int(row["year"])] = Quotas.from_row(row)
+    return out
+
+
+def _quotas_or_none(year: Optional[int], quotas_map: Optional[dict[int, Quotas]] = None) -> Optional[Quotas]:
     if year is None:
         return None
+    if quotas_map is not None:
+        return quotas_map.get(int(year))
     row = get_year_quota(year)
     if not row:
         return None
@@ -1273,6 +1285,7 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
     invoices = list_invoices_for_competence(year, month)
     enasarco_df = list_enasarco_lines_for_competence(year, month)
     withdrawals_df = list_withdrawals_for_month(year, month)
+    quotas_map = _load_quotas_map()
 
     total_lordo = 0.0
     total_esente = 0.0
@@ -1288,7 +1301,7 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
         issue = r.issue_date
         pay = r.payment_date
         attr = attribution_year(issue, pay)
-        quotas = _quotas_or_none(attr)
+        quotas = _quotas_or_none(attr, quotas_map)
         lordo = float(r.lordo_senza_enasarco)
         if quotas is None:
             if attr is not None:
@@ -1367,11 +1380,96 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
     }
 
 
-@st.cache_data(ttl=60, show_spinner="Calcolo totale prelevabile…")
+@st.cache_data(ttl=120, show_spinner=False)
 def total_ancora_prelevabile() -> float:
+    """
+    Somma dei netti residui mensili con poche query aggregate
+    (non un round-trip per ogni mese).
+    """
+    quotas_map = _load_quotas_map()
+
+    inv_df = _read_df(
+        """
+        SELECT
+            i.reference_year,
+            i.reference_month,
+            i.issue_date,
+            i.payment_date,
+            COALESCE(
+                SUM(l.amount) FILTER (
+                    WHERE l.line_type IS DISTINCT FROM 'enasarco'
+                ),
+                0
+            ) AS lordo
+        FROM invoices i
+        LEFT JOIN invoice_lines l ON l.invoice_id = i.id
+        GROUP BY i.id
+        """
+    )
+    ena_df = _read_df(
+        """
+        SELECT
+            i.reference_year,
+            i.reference_month,
+            COALESCE(SUM(l.amount), 0) AS enasarco
+        FROM invoices i
+        JOIN invoice_lines l ON l.invoice_id = i.id
+        WHERE i.kind = 'balance'
+          AND l.line_type = 'enasarco'
+        GROUP BY i.reference_year, i.reference_month
+        """
+    )
+    wd_df = _read_df(
+        """
+        SELECT
+            reference_year,
+            reference_month,
+            COALESCE(SUM(amount), 0) AS prelievi
+        FROM withdrawals
+        GROUP BY reference_year, reference_month
+        """
+    )
+
+    # Aggregati per mese di competenza
+    month_lordo: dict[tuple[int, int], float] = {}
+    month_inps: dict[tuple[int, int], float] = {}
+    month_ir: dict[tuple[int, int], float] = {}
+
+    if not inv_df.empty:
+        for r in inv_df.itertuples(index=False):
+            key = (int(r.reference_year), int(r.reference_month))
+            lordo = float(r.lordo)
+            month_lordo[key] = month_lordo.get(key, 0.0) + lordo
+            attr = attribution_year(r.issue_date, r.payment_date)
+            quotas = _quotas_or_none(attr, quotas_map)
+            if quotas is None:
+                continue
+            bd = breakdown_from_lordo(lordo, quotas)
+            month_inps[key] = month_inps.get(key, 0.0) + bd.inps_dovuto
+            month_ir[key] = month_ir.get(key, 0.0) + bd.imposta_reddito
+
+    month_ena: dict[tuple[int, int], float] = {}
+    if not ena_df.empty:
+        for r in ena_df.itertuples(index=False):
+            key = (int(r.reference_year), int(r.reference_month))
+            month_ena[key] = float(r.enasarco)
+
+    month_wd: dict[tuple[int, int], float] = {}
+    if not wd_df.empty:
+        for r in wd_df.itertuples(index=False):
+            key = (int(r.reference_year), int(r.reference_month))
+            month_wd[key] = float(r.prelievi)
+
+    keys = set(month_lordo) | set(month_ena) | set(month_wd)
     total = 0.0
-    for y, m in list_competence_periods():
-        total += float(compute_month_figures(y, m)["netto_residuo"])
+    for key in keys:
+        lordo = month_lordo.get(key, 0.0)
+        enasarco_tassa = -month_ena.get(key, 0.0)
+        inps = month_inps.get(key, 0.0)
+        ir = month_ir.get(key, 0.0)
+        prelievi = month_wd.get(key, 0.0)
+        netto_residuo = lordo - enasarco_tassa - inps - ir - prelievi
+        total += netto_residuo
     return total
 
 
