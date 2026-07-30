@@ -453,7 +453,13 @@ def list_invoices_for_competence(year: int, month: int) -> pd.DataFrame:
             i.series_year,
             i.reference_year,
             i.reference_month,
-            COALESCE(SUM(l.amount), 0) AS lines_total
+            COALESCE(SUM(l.amount), 0) AS lines_total,
+            COALESCE(
+                SUM(l.amount) FILTER (
+                    WHERE l.line_type IS DISTINCT FROM 'enasarco'
+                ),
+                0
+            ) AS lordo_senza_enasarco
         FROM invoices i
         LEFT JOIN invoice_lines l ON l.invoice_id = i.id
         WHERE i.reference_year = %s AND i.reference_month = %s
@@ -1229,9 +1235,8 @@ def _quotas_or_none(year: Optional[int]) -> Optional[Quotas]:
 def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
-        "Netto prelevabile del mese di competenza: lordo (totale righe) "
-        "meno INPS e imposta sul reddito di competenza, meno i prelievi. "
-        "L'enasarco è già nel lordo se presente tra le voci."
+        "Netto del mese di competenza: lordo (voci senza enasarco) "
+        "meno tasse (enasarco + INPS + IR), meno i prelievi."
     )
 
     periods = list_competence_periods()
@@ -1255,7 +1260,7 @@ def page_contabilita_mensile() -> None:
         return
 
     inv_rows = []
-    total_lordo = 0.0
+    total_lordo = 0.0  # al lordo di enasarco
     total_esente = 0.0
     total_inps = 0.0
     total_ir = 0.0
@@ -1268,7 +1273,7 @@ def page_contabilita_mensile() -> None:
         pay = r.payment_date
         attr = attribution_year(issue, pay)
         quotas = _quotas_or_none(attr)
-        lordo = float(r.lines_total)
+        lordo = float(r.lordo_senza_enasarco)
         if quotas is None:
             if attr is not None:
                 missing_quotas.add(attr)
@@ -1346,7 +1351,7 @@ def page_contabilita_mensile() -> None:
         {
             "Voce": "Enasarco (voci fattura di saldo)",
             "Importo": enasarco_total,
-            "Dettaglio": "Già compreso nel lordo (di solito negativo)",
+            "Dettaglio": "Detrazione in fattura (di solito negativo)",
         },
     ]
     st.dataframe(
@@ -1520,14 +1525,33 @@ def page_contabilita_mensile() -> None:
     # --- Riepilogo netto ---
     st.markdown("---")
     st.markdown("##### Riepilogo netto mese")
-    netto = total_lordo - total_inps - total_ir - wd_total
+    # Enasarco in fattura è negativo → costo tributo = −importo
+    enasarco_tassa = -enasarco_total
+    tasse = enasarco_tassa + total_inps + total_ir
+    netto = total_lordo - tasse
+    netto_residuo = netto - wd_total
+
     r1, r2, r3, r4, r5 = st.columns(5)
     r1.metric("Lordo", _fmt_euro(total_lordo))
-    r2.metric("di cui esente", _fmt_euro(total_esente))
-    r3.metric("INPS + IR", _fmt_euro(total_inps + total_ir))
+    r2.metric("Tasse", _fmt_euro(tasse))
+    r3.metric("Netto", _fmt_euro(netto))
     r4.metric("Prelievi", _fmt_euro(wd_total))
-    r5.metric("Netto residuo", _fmt_euro(netto))
+    with r5:
+        if netto_residuo > 0:
+            color = "#0a7a2f"
+        elif netto_residuo < 0:
+            color = "#c62828"
+        else:
+            color = "inherit"
+        st.markdown(
+            f'<p style="margin:0;font-size:0.875rem;opacity:0.7;">Netto residuo</p>'
+            f'<p style="margin:0;font-size:1.5rem;font-weight:600;color:{color};">'
+            f"{_fmt_euro(netto_residuo)}</p>",
+            unsafe_allow_html=True,
+        )
     st.caption(
-        "Netto residuo = lordo − INPS − imposta reddito − prelievi. "
-        "Se positivo, è la cifra ancora prelevabile senza andare in rosso sul mese."
+        "Lordo = voci senza enasarco · "
+        "Tasse = enasarco + INPS + IR · "
+        "Netto = lordo − tasse · "
+        "Netto residuo = netto − prelievi."
     )
