@@ -1267,29 +1267,27 @@ def collect_form_data(
             value=bool(d.get("data_ultima_visita")),
             key=f"{prefix}_has_ultima",
         )
-        data_ultima: Optional[date] = None
-        if has_ultima:
-            data_ultima = st.date_input(
-                "Data ultima visita",
-                value=_str_to_date(d.get("data_ultima_visita")) or date.today(),
-                format="DD/MM/YYYY",
-                key=f"{prefix}_ultima",
-            )
+        # Sempre montato (anche in st.form): niente if, altrimenti il checkbox
+        # non rivela il campo finché non si invia il form.
+        data_ultima = st.date_input(
+            "Data ultima visita",
+            value=_str_to_date(d.get("data_ultima_visita")) or date.today(),
+            format="DD/MM/YYYY",
+            key=f"{prefix}_ultima",
+        )
     with d2:
         has_prossimo = st.checkbox(
             "Imposta data prossimo appuntamento",
             value=bool(d.get("data_prossimo_appuntamento")),
             key=f"{prefix}_has_prossimo",
         )
-        data_prossimo: Optional[date] = None
-        if has_prossimo:
-            data_prossimo = st.date_input(
-                "Data prossimo appuntamento",
-                value=_str_to_date(d.get("data_prossimo_appuntamento"))
-                or date.today(),
-                format="DD/MM/YYYY",
-                key=f"{prefix}_prossimo",
-            )
+        data_prossimo = st.date_input(
+            "Data prossimo appuntamento",
+            value=_str_to_date(d.get("data_prossimo_appuntamento"))
+            or date.today(),
+            format="DD/MM/YYYY",
+            key=f"{prefix}_prossimo",
+        )
 
     note_prossimo = st.text_area(
         "Note per il prossimo appuntamento",
@@ -1315,8 +1313,10 @@ def collect_form_data(
         "telefono_cellulare": telefono_cellulare.strip(),
         "email": email.strip(),
         **orari,
-        "data_ultima_visita": _date_to_str(data_ultima),
-        "data_prossimo_appuntamento": _date_to_str(data_prossimo),
+        "data_ultima_visita": _date_to_str(data_ultima) if has_ultima else None,
+        "data_prossimo_appuntamento": _date_to_str(data_prossimo)
+        if has_prossimo
+        else None,
         "note_prossimo_appuntamento": note_prossimo.strip(),
         "note_generali": note_generali.strip(),
         "canale_contatto_preferito": canale,
@@ -1362,30 +1362,50 @@ def page_login() -> None:
 def page_elenco() -> None:
     st.subheader("Elenco medici")
 
-    f1, f2, f3 = st.columns([3, 1.2, 1.2])
-    with f1:
-        query = st.text_input(
-            "Ricerca",
-            placeholder="Nome, cognome o città…",
-            key="search_query",
-        )
-    with f2:
-        spec_filter = st.selectbox(
-            "Specializzazione",
-            options=["Tutte", *SPECIALIZZAZIONI],
-            key="search_spec",
-        )
-    with f3:
-        micro_filter = st.selectbox(
-            "Microarea",
-            options=["Tutte", *MICROAREE],
-            key="search_micro",
-        )
+    if "medici_search" not in st.session_state:
+        st.session_state.medici_search = {
+            "query": "",
+            "spec": "Tutte",
+            "micro": "Tutte",
+        }
 
+    with st.form("medici_search_form", clear_on_submit=False):
+        f1, f2, f3 = st.columns([3, 1.2, 1.2])
+        with f1:
+            query = st.text_input(
+                "Ricerca",
+                value=st.session_state.medici_search["query"],
+                placeholder="Nome, cognome o città…",
+            )
+        with f2:
+            spec_opts = ["Tutte", *SPECIALIZZAZIONI]
+            spec_cur = st.session_state.medici_search["spec"]
+            spec_filter = st.selectbox(
+                "Specializzazione",
+                options=spec_opts,
+                index=spec_opts.index(spec_cur) if spec_cur in spec_opts else 0,
+            )
+        with f3:
+            micro_opts = ["Tutte", *MICROAREE]
+            micro_cur = st.session_state.medici_search["micro"]
+            micro_filter = st.selectbox(
+                "Microarea",
+                options=micro_opts,
+                index=micro_opts.index(micro_cur) if micro_cur in micro_opts else 0,
+            )
+        if st.form_submit_button("Cerca", type="primary"):
+            st.session_state.medici_search = {
+                "query": query,
+                "spec": spec_filter,
+                "micro": micro_filter,
+            }
+            st.rerun()
+
+    s = st.session_state.medici_search
     df = search_medici(
-        query=query,
-        microarea=micro_filter,
-        specializzazione=spec_filter,
+        query=s["query"],
+        microarea=s["micro"],
+        specializzazione=s["spec"],
     )
 
     st.caption(f"{len(df)} medic{'o' if len(df) == 1 else 'i'} trovati")
@@ -1433,12 +1453,12 @@ def page_elenco() -> None:
     )
 
     with st.expander("Scheda completa", expanded=True):
-        # Prefisso legato all'id così i campi si aggiornano al cambio riga
-        data = collect_form_data(f"edit_{medico_id}", defaults=medico)
-
-        b1, b2, b3 = st.columns([1, 1, 2])
-        with b1:
-            if st.button("Salva modifiche", type="primary", width="stretch"):
+        with st.form(f"edit_medico_{medico_id}", clear_on_submit=False):
+            data = collect_form_data(f"edit_{medico_id}", defaults=medico)
+            saved = st.form_submit_button(
+                "Salva modifiche", type="primary", width="stretch"
+            )
+            if saved:
                 err = validate_medico(data)
                 if err:
                     st.error(err)
@@ -1446,35 +1466,37 @@ def page_elenco() -> None:
                     update_medico(medico_id, data)
                     st.success("Medico aggiornato.")
                     st.rerun()
-        with b2:
-            confirm = st.checkbox(
-                "Conferma eliminazione", key=f"confirm_delete_{medico_id}"
-            )
-            if st.button(
-                "Elimina",
-                type="secondary",
-                width="stretch",
-                disabled=not confirm,
-            ):
-                delete_medico(medico_id)
-                st.success("Medico eliminato.")
-                st.rerun()
+
+        confirm = st.checkbox(
+            "Conferma eliminazione", key=f"confirm_delete_{medico_id}"
+        )
+        if st.button(
+            "Elimina",
+            type="secondary",
+            width="stretch",
+            disabled=not confirm,
+            key=f"delete_medico_{medico_id}",
+        ):
+            delete_medico(medico_id)
+            st.success("Medico eliminato.")
+            st.rerun()
 
 
 def page_nuovo() -> None:
     st.subheader("Nuovo medico")
     st.caption("I campi contrassegnati con * sono obbligatori.")
 
-    data = collect_form_data("new")
-
-    if st.button("Inserisci", type="primary"):
-        err = validate_medico(data)
-        if err:
-            st.error(err)
-        else:
-            new_id = insert_medico(data)
-            st.success(f"Medico inserito (ID {new_id}).")
-            st.balloons()
+    with st.form("nuovo_medico_form", clear_on_submit=False):
+        data = collect_form_data("new")
+        submitted = st.form_submit_button("Inserisci", type="primary")
+        if submitted:
+            err = validate_medico(data)
+            if err:
+                st.error(err)
+            else:
+                new_id = insert_medico(data)
+                st.success(f"Medico inserito (ID {new_id}).")
+                st.balloons()
 
 
 def page_importa() -> None:
