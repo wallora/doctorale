@@ -119,6 +119,17 @@ def attribution_year(
     return None
 
 
+def attribution_year_month(
+    issue_date: Optional[date],
+    payment_date: Optional[date],
+) -> Optional[tuple[int, int]]:
+    """Mese di incasso: pagamento se presente, altrimenti emissione."""
+    d = payment_date if payment_date is not None else issue_date
+    if d is None:
+        return None
+    return int(d.year), int(d.month)
+
+
 def attribution_sort_date(
     issue_date: Optional[date],
     payment_date: Optional[date],

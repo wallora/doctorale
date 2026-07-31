@@ -19,6 +19,7 @@ from finance_calc import (
     annual_taxes,
     attribution_sort_date,
     attribution_year,
+    attribution_year_month,
     certain_reserve,
     variable_reserve,
 )
@@ -430,22 +431,31 @@ def delete_withdrawal(withdrawal_id: int) -> None:
             cur.execute("DELETE FROM withdrawals WHERE id = %s", (withdrawal_id,))
 
 
-def list_competence_periods() -> list[tuple[int, int]]:
+def list_collection_periods() -> list[tuple[int, int]]:
+    """Mesi con incassi (pagamento o emissione) e/o prelievi di riferimento."""
     sql = """
-        SELECT DISTINCT reference_year, reference_month
-        FROM invoices
-        ORDER BY reference_year DESC, reference_month DESC
+        SELECT y, m FROM (
+            SELECT
+                EXTRACT(YEAR FROM COALESCE(payment_date, issue_date))::INTEGER AS y,
+                EXTRACT(MONTH FROM COALESCE(payment_date, issue_date))::INTEGER AS m
+            FROM invoices
+            WHERE COALESCE(payment_date, issue_date) IS NOT NULL
+            UNION
+            SELECT reference_year AS y, reference_month AS m
+            FROM withdrawals
+            WHERE reference_year IS NOT NULL AND reference_month IS NOT NULL
+        ) t
+        WHERE y IS NOT NULL AND m IS NOT NULL
+        ORDER BY y DESC, m DESC
     """
     df = _read_df(sql)
     if df.empty:
         return []
-    return [
-        (int(r.reference_year), int(r.reference_month))
-        for r in df.itertuples(index=False)
-    ]
+    return [(int(r.y), int(r.m)) for r in df.itertuples(index=False)]
 
 
-def list_invoices_for_competence(year: int, month: int) -> pd.DataFrame:
+def list_invoices_for_collection(year: int, month: int) -> pd.DataFrame:
+    """Fatture il cui mese di incasso (pagamento o emissione) è year/month."""
     sql = """
         SELECT
             i.id,
@@ -465,9 +475,12 @@ def list_invoices_for_competence(year: int, month: int) -> pd.DataFrame:
             ) AS lordo_senza_enasarco
         FROM invoices i
         LEFT JOIN invoice_lines l ON l.invoice_id = i.id
-        WHERE i.reference_year = %s AND i.reference_month = %s
+        WHERE EXTRACT(YEAR FROM COALESCE(i.payment_date, i.issue_date)) = %s
+          AND EXTRACT(MONTH FROM COALESCE(i.payment_date, i.issue_date)) = %s
         GROUP BY i.id
-        ORDER BY i.kind ASC, i.number ASC
+        ORDER BY
+            COALESCE(i.payment_date, i.issue_date) ASC NULLS LAST,
+            i.number ASC
     """
     return _read_df(sql, [year, month])
 
@@ -500,29 +513,32 @@ def list_invoices_lordo_all() -> pd.DataFrame:
     return _read_df(sql)
 
 
-def enasarco_by_competence_month() -> dict[tuple[int, int], float]:
+def enasarco_by_collection_month() -> dict[tuple[int, int], float]:
     df = _read_df(
         """
         SELECT
-            i.reference_year,
-            i.reference_month,
+            EXTRACT(YEAR FROM COALESCE(i.payment_date, i.issue_date))::INTEGER AS y,
+            EXTRACT(MONTH FROM COALESCE(i.payment_date, i.issue_date))::INTEGER AS m,
             COALESCE(SUM(l.amount), 0) AS enasarco
         FROM invoices i
         JOIN invoice_lines l ON l.invoice_id = i.id
         WHERE i.kind = 'balance'
           AND l.line_type = 'enasarco'
-        GROUP BY i.reference_year, i.reference_month
+          AND COALESCE(i.payment_date, i.issue_date) IS NOT NULL
+        GROUP BY 1, 2
         """
     )
     if df.empty:
         return {}
     return {
-        (int(r.reference_year), int(r.reference_month)): float(r.enasarco)
+        (int(r.y), int(r.m)): float(r.enasarco)
         for r in df.itertuples(index=False)
+        if r.y is not None and r.m is not None
     }
 
 
-def withdrawals_by_competence_month() -> dict[tuple[int, int], float]:
+def withdrawals_by_month() -> dict[tuple[int, int], float]:
+    """Prelievi aggregati per mese di riferimento (come in Contabilità mensile)."""
     df = _read_df(
         """
         SELECT
@@ -541,8 +557,8 @@ def withdrawals_by_competence_month() -> dict[tuple[int, int], float]:
     }
 
 
-def list_enasarco_lines_for_competence(year: int, month: int) -> pd.DataFrame:
-    """Voci enasarco sulle fatture di saldo del mese di competenza."""
+def list_enasarco_lines_for_collection(year: int, month: int) -> pd.DataFrame:
+    """Voci enasarco sulle fatture di saldo del mese di incasso."""
     sql = """
         SELECT
             i.id AS invoice_id,
@@ -552,8 +568,8 @@ def list_enasarco_lines_for_competence(year: int, month: int) -> pd.DataFrame:
             l.amount
         FROM invoices i
         JOIN invoice_lines l ON l.invoice_id = i.id
-        WHERE i.reference_year = %s
-          AND i.reference_month = %s
+        WHERE EXTRACT(YEAR FROM COALESCE(i.payment_date, i.issue_date)) = %s
+          AND EXTRACT(MONTH FROM COALESCE(i.payment_date, i.issue_date)) = %s
           AND i.kind = 'balance'
           AND l.line_type = 'enasarco'
         ORDER BY i.number, l.sort_order, l.id
@@ -1369,7 +1385,6 @@ def _invoice_variable_reserves(
                 "attr": attr,
                 "lordo": float(r.lordo),
                 "sort": attribution_sort_date(r.issue_date, r.payment_date),
-                "ref": (int(r.reference_year), int(r.reference_month)),
             }
         )
     rows.sort(key=lambda x: (x["attr"] or 0, x["sort"], x["id"]))
@@ -1393,11 +1408,11 @@ def _invoice_variable_reserves(
 
 def compute_month_figures(year: int, month: int) -> dict[str, Any]:
     """
-    Calcoli mese: riserve variabili + enasarco sulle fatture;
+    Calcoli sul mese di incasso: riserve variabili + enasarco sulle fatture;
     riserva certa e prelievi a livello mese.
     """
-    invoices = list_invoices_for_competence(year, month)
-    enasarco_df = list_enasarco_lines_for_competence(year, month)
+    invoices = list_invoices_for_collection(year, month)
+    enasarco_df = list_enasarco_lines_for_collection(year, month)
     withdrawals_df = list_withdrawals_for_month(year, month)
     quotas_map = _load_quotas_map()
     fatturato_anni = fatturato_by_attribution_year()
@@ -1477,10 +1492,16 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
 
         netto_inv = lordo - ena_tassa - v_inps - v_ir
         netto_fatture += netto_inv
+        competenza = (
+            f"{_month_label(int(r.reference_month))} {int(r.reference_year)}"
+            if r.reference_year is not None and r.reference_month is not None
+            else "—"
+        )
         inv_rows.append(
             {
                 "N.": f"{int(r.series_year)}-{int(r.number):02d}",
                 "Tipo": INVOICE_KIND_LABELS.get(r.kind, r.kind),
+                "Competenza": competenza,
                 "Emissione": issue,
                 "Pagamento": pay,
                 "Lordo": lordo,
@@ -1534,13 +1555,13 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def total_ancora_prelevabile() -> float:
-    """Somma netti residui: riserva certa/12 + variabile + enasarco − prelievi."""
+    """Somma netti residui per mese di incasso: certa/12 + var + enasarco − prelievi."""
     quotas_map = _load_quotas_map()
     fatturato_anni = fatturato_by_attribution_year()
     all_inv = list_invoices_lordo_all()
     var_by_id = _invoice_variable_reserves(all_inv, quotas_map)
-    month_ena = enasarco_by_competence_month()
-    month_wd = withdrawals_by_competence_month()
+    month_ena = enasarco_by_collection_month()
+    month_wd = withdrawals_by_month()
 
     month_lordo: dict[tuple[int, int], float] = {}
     month_var_inps: dict[tuple[int, int], float] = {}
@@ -1549,8 +1570,10 @@ def total_ancora_prelevabile() -> float:
 
     if not all_inv.empty:
         for r in all_inv.itertuples(index=False):
-            key = (int(r.reference_year), int(r.reference_month))
-            years.add(int(r.reference_year))
+            key = attribution_year_month(r.issue_date, r.payment_date)
+            if key is None:
+                continue
+            years.add(key[0])
             lordo = float(r.lordo)
             month_lordo[key] = month_lordo.get(key, 0.0) + lordo
             vr = var_by_id.get(int(r.id))
@@ -1558,9 +1581,9 @@ def total_ancora_prelevabile() -> float:
                 month_var_inps[key] = month_var_inps.get(key, 0.0) + vr.inps
                 month_var_ir[key] = month_var_ir.get(key, 0.0) + vr.ir
 
-    for y, m in month_ena:
+    for y, _m in month_ena:
         years.add(y)
-    for y, m in month_wd:
+    for y, _m in month_wd:
         years.add(y)
 
     certa_by_year: dict[int, tuple[float, float]] = {}
@@ -1598,14 +1621,14 @@ def total_ancora_prelevabile() -> float:
 def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
-        "Su ogni fattura: enasarco + riserva variabile (data incasso / YTD). "
-        f"A livello mese: riserva certa ÷ {CERTAIN_RESERVE_MONTHS} e prelievi. "
-        "Il netto mese è la somma dei netti fattura meno la certa."
+        "Mese = data di incasso (pagamento, o emissione se ancora non pagata). "
+        "Su ogni fattura: enasarco + riserva variabile. "
+        f"A livello mese: riserva certa ÷ {CERTAIN_RESERVE_MONTHS} e prelievi."
     )
 
-    periods = list_competence_periods()
+    periods = list_collection_periods()
     if not periods:
-        st.info("Nessuna fattura con mese di competenza.")
+        st.info("Nessuna fattura con data di incasso.")
         return
 
     _colored_amount_box(
@@ -1614,7 +1637,7 @@ def page_contabilita_mensile() -> None:
     )
 
     labels = [f"{_month_label(m)} {y}" for y, m in periods]
-    choice = st.selectbox("Mese di competenza", options=labels, key="fin_month_period")
+    choice = st.selectbox("Mese di incasso", options=labels, key="fin_month_period")
     year, month = periods[labels.index(choice)]
 
     fig = compute_month_figures(year, month)
@@ -1631,9 +1654,9 @@ def page_contabilita_mensile() -> None:
     wd_total = float(fig["prelievi"])
 
     # --- Fatture: riserve variabili + netto per documento ---
-    st.markdown("##### Fatture del mese")
+    st.markdown("##### Fatture incassate nel mese")
     if not fig["inv_rows"]:
-        st.info("Nessuna fattura in questo mese.")
+        st.info("Nessuna fattura incassata in questo mese.")
     else:
         st.dataframe(
             pd.DataFrame(fig["inv_rows"]),
