@@ -26,7 +26,6 @@ from finance_calc import (
     fixed_inps_months_in_year,
     inps_minimale_annuo,
     invoice_reserve,
-    iter_year_months,
 )
 
 INVOICE_KIND_LABELS = {
@@ -1774,7 +1773,6 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
 
 
 def _clear_finance_caches() -> None:
-    total_ancora_prelevabile.clear()
     _annual_finance_bundle.clear()
     _finance_activity_start.clear()
 
@@ -1794,56 +1792,6 @@ def _finance_activity_start() -> Optional[tuple[int, int]]:
     return min(keys) if keys else None
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def total_ancora_prelevabile() -> float:
-    """Somma netti residui per mese: da inizio attività al mese corrente."""
-    quotas_map = _load_quotas_map()
-    fatturato_anni = fatturato_by_attribution_year()
-    all_inv = list_invoices_lordo_all()
-    res_by_id = _invoice_reserves(all_inv, quotas_map, fatturato_anni)
-    month_ena = enasarco_by_collection_month()
-    month_wd = withdrawals_by_month()
-
-    month_lordo: dict[tuple[int, int], float] = {}
-    month_acc: dict[tuple[int, int], float] = {}
-
-    if not all_inv.empty:
-        for r in all_inv.itertuples(index=False):
-            key = attribution_year_month(r.issue_date, r.payment_date)
-            if key is None:
-                continue
-            lordo = float(r.lordo)
-            month_lordo[key] = month_lordo.get(key, 0.0) + lordo
-            res = res_by_id.get(int(r.id))
-            if res is not None:
-                month_acc[key] = month_acc.get(key, 0.0) + res.totale
-
-    activity_keys = set(month_lordo) | set(month_ena) | set(month_wd) | set(month_acc)
-    activity_start = min(activity_keys) if activity_keys else None
-    if activity_start is None:
-        return 0.0
-    as_of = as_of_month()
-
-    fissa_by_year: dict[int, float] = {}
-    total = 0.0
-    for key in iter_year_months(activity_start, as_of):
-        y, m = key
-        if y not in fissa_by_year:
-            q = quotas_map.get(y)
-            fissa_by_year[y] = fixed_inps_month(q) if q else 0.0
-        lordo = month_lordo.get(key, 0.0)
-        enasarco_tassa = -month_ena.get(key, 0.0)
-        fissa = (
-            fissa_by_year[y]
-            if applies_fixed_inps(y, m, activity_start, as_of)
-            else 0.0
-        )
-        acc = month_acc.get(key, 0.0) + fissa
-        prelievi = month_wd.get(key, 0.0)
-        total += lordo - enasarco_tassa - acc - prelievi
-    return total
-
-
 def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
@@ -1857,11 +1805,6 @@ def page_contabilita_mensile() -> None:
     if not periods:
         st.info("Nessuna fattura incassata.")
         return
-
-    _colored_amount_box(
-        "Totale ancora prelevabile (somma netti residui di tutti i mesi)",
-        total_ancora_prelevabile(),
-    )
 
     labels = [f"{_month_label(m)} {y}" for y, m in periods]
     choice = st.selectbox("Mese di incasso", options=labels, key="fin_month_period")
