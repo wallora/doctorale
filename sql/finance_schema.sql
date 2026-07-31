@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS payment_reminders_sent (
     PRIMARY KEY (payment_id, days_before)
 );
 
+-- Promemoria fissi annuali (1 giu Camera Commercio, 10 gen rate INPS)
+CREATE TABLE IF NOT EXISTS calendar_reminders_sent (
+    reminder_key TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (reminder_key, year)
+);
+
 CREATE TABLE IF NOT EXISTS withdrawals (
     id BIGSERIAL PRIMARY KEY,
     withdrawal_date DATE,
@@ -142,4 +150,5 @@ ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE invoice_lines ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tax_payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_reminders_sent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE calendar_reminders_sent ENABLE ROW LEVEL SECURITY;
 ALTER TABLE withdrawals ENABLE ROW LEVEL SECURITY;
