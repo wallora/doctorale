@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Optional
 
+import altair as alt
 import pandas as pd
 import psycopg2.extras
 import streamlit as st
@@ -2066,7 +2067,26 @@ def page_contabilita_annuale() -> None:
         chart_data[label] = values
 
     chart_df = pd.DataFrame(chart_data, index=month_labels)
-    st.line_chart(chart_df, width="stretch")
+    long = (
+        chart_df.reset_index(names="Mese")
+        .melt(id_vars="Mese", var_name="Serie", value_name="Valore")
+    )
+    chart = (
+        alt.Chart(long)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("Mese:N", sort=month_labels, title=None),
+            y=alt.Y("Valore:Q", title="€"),
+            color=alt.Color("Serie:N", title=None),
+            tooltip=[
+                alt.Tooltip("Mese:N"),
+                alt.Tooltip("Serie:N"),
+                alt.Tooltip("Valore:Q", format=",.2f"),
+            ],
+        )
+        .properties(height=400)
+    )
+    st.altair_chart(chart, width="stretch")
 
     with st.expander("Dati tabellari", expanded=False):
         col_config = {
