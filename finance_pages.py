@@ -16,7 +16,6 @@ from sales_parser import MESI_LABEL
 from finance_calc import (
     CERTAIN_RESERVE_MONTHS,
     Quotas,
-    annual_taxes,
     attribution_sort_date,
     attribution_year,
     attribution_year_month,
@@ -1225,7 +1224,7 @@ def page_elenco_prelievi() -> None:
 
 
 def page_quote_annuali() -> None:
-    st.subheader("Quote annuali")
+    st.subheader("Aliquote")
 
     df = list_year_quotas()
     if df.empty:
@@ -1490,13 +1489,13 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
                 "Pagamento": pay,
                 "YTD prima": ytd_before,
                 "Soglia": soglia,
-                "F(Y−1)": f_prev,
+                "Fatt. anno prec.": f_prev,
                 "Lordo": lordo,
                 "Enasarco": ena_tassa,
-                "INPS var": inps_var,
-                "IR var": ir_var,
-                "INPS extra": inps_extra,
-                "IR extra": ir_extra,
+                "INPS acconto": inps_var,
+                "IR acconto": ir_var,
+                "INPS saldo": inps_extra,
+                "IR saldo": ir_extra,
                 "Da accantonare": totale_inv,
                 "Netto": netto_inv,
             }
@@ -1589,7 +1588,7 @@ def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
         "Mese = data di pagamento (solo fatture incassate). "
-        "Per fattura: enasarco + IR/INPS var (acconto) + IR/INPS extra (saldo). "
+        "Per fattura: enasarco + INPS/IR acconto + INPS/IR saldo. "
         f"Per mese: INPS fissa (minimale ÷ {CERTAIN_RESERVE_MONTHS})."
     )
 
@@ -1608,10 +1607,7 @@ def page_contabilita_mensile() -> None:
     year, month = periods[labels.index(choice)]
 
     fig = compute_month_figures(year, month)
-    enasarco_df = fig["enasarco_df"]
     withdrawals_df = fig["withdrawals_df"]
-    fatturato_anni = fig["fatturato_anni"]
-    attr_years_used: set[int] = fig["attr_years_used"]
     missing_quotas: set[int] = fig["missing_quotas"]
     inps_fissa = float(fig["inps_fissa"])
     inps_min_annuo = float(fig["inps_min_annuo"])
@@ -1619,6 +1615,11 @@ def page_contabilita_mensile() -> None:
     totale_mese = float(fig["totale_mese"])
     wd_total = float(fig["prelievi"])
     current_quotas = fig["current_quotas"]
+    lordo = float(fig["lordo"])
+    enasarco_tassa = float(fig["enasarco_tassa"])
+    lordo_netto_ena = lordo - enasarco_tassa
+    netto_mese = lordo_netto_ena - totale_mese
+    netto_residuo = netto_mese - wd_total
 
     st.markdown("##### Fatture incassate nel mese")
     if not fig["inv_rows"]:
@@ -1627,13 +1628,13 @@ def page_contabilita_mensile() -> None:
         money_cols = [
             "YTD prima",
             "Soglia",
-            "F(Y−1)",
+            "Fatt. anno prec.",
             "Lordo",
             "Enasarco",
-            "INPS var",
-            "IR var",
-            "INPS extra",
-            "IR extra",
+            "INPS acconto",
+            "IR acconto",
+            "INPS saldo",
+            "IR saldo",
             "Da accantonare",
             "Netto",
         ]
@@ -1652,39 +1653,13 @@ def page_contabilita_mensile() -> None:
         )
         st.caption(
             f"Somma da accantonare sulle fatture: **{_fmt_euro(totale_fatture)}** "
-            f"(INPS/IR var + INPS/IR extra)"
+            f"(acconto + saldo)"
         )
     if missing_quotas:
         st.warning(
             "Mancano le quote annuali per: "
             + ", ".join(str(y) for y in sorted(missing_quotas))
         )
-
-    if not enasarco_df.empty:
-        with st.expander("Dettaglio voci enasarco", expanded=False):
-            show_e = pd.DataFrame(
-                {
-                    "Fattura": enasarco_df.apply(
-                        lambda r: f"{int(r['series_year'])}-{int(r['number']):02d}",
-                        axis=1,
-                    ),
-                    "Descrizione": enasarco_df["description"],
-                    "Importo voce": pd.to_numeric(
-                        enasarco_df["amount"], errors="coerce"
-                    ),
-                }
-            )
-            st.dataframe(
-                show_e,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Importo voce": st.column_config.NumberColumn(
-                        "Importo voce", format="€ %.2f"
-                    ),
-                },
-                key=f"fin_month_enasarco_{year}_{month}",
-            )
 
     st.markdown("##### Accantonamento fisso del mese")
     if current_quotas is None:
@@ -1719,35 +1694,22 @@ def page_contabilita_mensile() -> None:
         "Indipendente dal fatturato: dovuta ogni mese anche senza incassi."
     )
 
-    years_ctx = set(attr_years_used)
-    years_ctx.add(year)
-    years_ctx.add(year - 1)
-    with st.expander("Contesto tasse annuali (saldo + acconto)", expanded=False):
-        st.caption(
-            "Fatturato = solo fatture pagate. "
-            "Saldo = surplus vs anno precedente; acconto = % sul fatturato anno."
-        )
-        for ay in sorted(y for y in years_ctx if y > 0):
-            quotas = _quotas_or_none(ay)
-            if quotas is None:
-                st.caption(f"Anno {ay}: quote mancanti.")
-                continue
-            fat = fatturato_anni.get(ay, 0.0)
-            fat_prev = fatturato_anni.get(ay - 1, 0.0)
-            ann = annual_taxes(ay, fat, fat_prev, quotas)
-            st.markdown(f"**Anno {ay}** (quote {ay})")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Fatturato", _fmt_euro(ann.fatturato))
-            c2.metric("Anno precedente", _fmt_euro(ann.fatturato_prev))
-            c3.metric("Surplus", _fmt_euro(ann.surplus))
-            st.caption(
-                f"INPS saldo {_fmt_euro(ann.inps_saldo)} + acconto "
-                f"{_fmt_euro(ann.inps_acconto)} = **{_fmt_euro(ann.inps_totale)}** · "
-                f"IR saldo {_fmt_euro(ann.ir_saldo)} + acconto "
-                f"{_fmt_euro(ann.ir_acconto)} = **{_fmt_euro(ann.ir_totale)}**"
-            )
+    form_key = f"fin_month_wd_form_open_{year}_{month}"
+    if form_key not in st.session_state:
+        st.session_state[form_key] = False
 
-    st.markdown("##### Prelievi del mese")
+    h1, h2 = st.columns([6, 1])
+    with h1:
+        st.markdown("##### Prelievi del mese")
+    with h2:
+        if st.button(
+            "−" if st.session_state[form_key] else "+",
+            key=f"fin_month_wd_toggle_{year}_{month}",
+            help="Mostra/nascondi nuovo prelievo",
+        ):
+            st.session_state[form_key] = not st.session_state[form_key]
+            st.rerun()
+
     if withdrawals_df.empty:
         st.info("Nessun prelievo in questo mese.")
         selected: list[int] = []
@@ -1776,92 +1738,99 @@ def page_contabilita_mensile() -> None:
         selected = event.selection.rows if event and event.selection else []
         st.caption(f"Totale prelievi: **{_fmt_euro(wd_total)}**")
 
-    st.markdown("---")
     withdrawal: Optional[dict[str, Any]] = None
     withdrawal_id: Optional[int] = None
     if selected and not df_wd.empty:
         withdrawal_id = int(df_wd.iloc[selected[0]]["id"])
         withdrawal = get_withdrawal(withdrawal_id)
-        st.markdown("##### Modifica prelievo")
-    else:
-        st.markdown("##### Nuovo prelievo per questo mese")
 
-    defaults = withdrawal or {
-        "withdrawal_date": date(year, month, 1),
-        "reference_year": year,
-        "reference_month": month,
-        "amount": 0.0,
-        "description": "",
-    }
+    show_form = st.session_state[form_key] or withdrawal is not None
+    if show_form:
+        st.markdown("---")
+        if withdrawal is not None:
+            st.markdown("##### Modifica prelievo")
+        else:
+            st.markdown("##### Nuovo prelievo per questo mese")
 
-    d1, d2 = st.columns(2)
-    with d1:
-        withdrawal_date = st.date_input(
-            "Data prelievo",
-            value=defaults.get("withdrawal_date") or date(year, month, 1),
-            key=f"mwd_date_{year}_{month}_{withdrawal_id or 'new'}",
-        )
-    with d2:
-        amount = st.number_input(
-            "Importo (€)",
-            value=_money(defaults.get("amount")),
-            step=0.01,
-            format="%.2f",
-            key=f"mwd_amt_{year}_{month}_{withdrawal_id or 'new'}",
-        )
-    description = st.text_input(
-        "Descrizione",
-        value=defaults.get("description") or "",
-        key=f"mwd_desc_{year}_{month}_{withdrawal_id or 'new'}",
-    )
+        defaults = withdrawal or {
+            "withdrawal_date": date(year, month, 1),
+            "reference_year": year,
+            "reference_month": month,
+            "amount": 0.0,
+            "description": "",
+        }
 
-    b1, b2, _ = st.columns([1, 1, 2])
-    with b1:
-        if st.button(
-            "Salva prelievo",
-            type="primary",
-            key=f"mwd_save_{year}_{month}_{withdrawal_id or 'new'}",
-        ):
-            upsert_withdrawal(
-                {
-                    "withdrawal_date": withdrawal_date,
-                    "reference_year": year,
-                    "reference_month": month,
-                    "amount": float(amount),
-                    "description": description or "",
-                },
-                withdrawal_id=withdrawal_id,
+        d1, d2 = st.columns(2)
+        with d1:
+            withdrawal_date = st.date_input(
+                "Data prelievo",
+                value=defaults.get("withdrawal_date") or date(year, month, 1),
+                key=f"mwd_date_{year}_{month}_{withdrawal_id or 'new'}",
             )
-            total_ancora_prelevabile.clear()
-            st.success("Prelievo salvato.")
-            st.rerun()
-    with b2:
-        if withdrawal_id is not None:
-            confirm = st.checkbox(
-                "Conferma eliminazione",
-                key=f"mwd_del_confirm_{year}_{month}_{withdrawal_id}",
+        with d2:
+            amount = st.number_input(
+                "Importo (€)",
+                value=_money(defaults.get("amount")),
+                step=0.01,
+                format="%.2f",
+                key=f"mwd_amt_{year}_{month}_{withdrawal_id or 'new'}",
             )
+        description = st.text_input(
+            "Descrizione",
+            value=defaults.get("description") or "",
+            key=f"mwd_desc_{year}_{month}_{withdrawal_id or 'new'}",
+        )
+
+        b1, b2, _ = st.columns([1, 1, 2])
+        with b1:
             if st.button(
-                "Elimina",
-                disabled=not confirm,
-                key=f"mwd_del_{year}_{month}_{withdrawal_id}",
+                "Salva prelievo",
+                type="primary",
+                key=f"mwd_save_{year}_{month}_{withdrawal_id or 'new'}",
             ):
-                delete_withdrawal(withdrawal_id)
+                upsert_withdrawal(
+                    {
+                        "withdrawal_date": withdrawal_date,
+                        "reference_year": year,
+                        "reference_month": month,
+                        "amount": float(amount),
+                        "description": description or "",
+                    },
+                    withdrawal_id=withdrawal_id,
+                )
                 total_ancora_prelevabile.clear()
-                st.success("Prelievo eliminato.")
+                st.session_state[form_key] = False
+                st.success("Prelievo salvato.")
                 st.rerun()
+        with b2:
+            if withdrawal_id is not None:
+                confirm = st.checkbox(
+                    "Conferma eliminazione",
+                    key=f"mwd_del_confirm_{year}_{month}_{withdrawal_id}",
+                )
+                if st.button(
+                    "Elimina",
+                    disabled=not confirm,
+                    key=f"mwd_del_{year}_{month}_{withdrawal_id}",
+                ):
+                    delete_withdrawal(withdrawal_id)
+                    total_ancora_prelevabile.clear()
+                    st.success("Prelievo eliminato.")
+                    st.rerun()
 
     st.markdown("---")
     st.markdown("##### Riepilogo netto mese")
     r1, r2, r3, r4, r5 = st.columns(5)
-    r1.metric("Lordo", _fmt_euro(fig["lordo"]))
-    r2.metric("Enasarco", _fmt_euro(fig["enasarco_tassa"]))
-    r3.metric("Da accantonare", _fmt_euro(totale_mese))
+    r1.metric("Lordo (netto Enasarco)", _fmt_euro(lordo_netto_ena))
+    r2.metric("Da accantonare", _fmt_euro(totale_mese))
+    r3.metric("Netto", _fmt_euro(netto_mese))
     r4.metric("Prelievi", _fmt_euro(wd_total))
     with r5:
-        _colored_metric("Netto residuo", float(fig["netto_residuo"]))
+        _colored_metric("Netto residuo", netto_residuo)
     st.caption(
         f"Da accantonare = somma fatture {_fmt_euro(totale_fatture)} "
         f"+ INPS fissa {_fmt_euro(inps_fissa)}. "
-        "Netto = lordo − enasarco − da accantonare − prelievi."
+        "Lordo (netto Enasarco) = lordo − enasarco · "
+        "Netto = lordo netto enasarco − da accantonare · "
+        "Netto residuo = netto − prelievi."
     )

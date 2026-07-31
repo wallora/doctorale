@@ -2264,7 +2264,7 @@ def main() -> None:
                     "Elenco Fatture",
                     "Elenco pagamenti",
                     "Elenco prelievi",
-                    "Quote annuali",
+                    "Aliquote",
                 ],
                 key="nav_contab",
             )
@@ -2282,7 +2282,7 @@ def main() -> None:
             page_elenco_pagamenti()
         elif pagina_contab == "Elenco prelievi":
             page_elenco_prelievi()
-        elif pagina_contab == "Quote annuali":
+        elif pagina_contab == "Aliquote":
             page_quote_annuali()
         elif pagina_contab == "Elenco Fatture":
             page_elenco_fatture()
