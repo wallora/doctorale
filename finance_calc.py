@@ -74,15 +74,23 @@ class AnnualTax:
 
 @dataclass(frozen=True)
 class CertainReserve:
-    """Obblighi già determinati dal fatturato dell'anno precedente, / 12."""
+    """
+    Riserva certa mensile = obblighi annuali / 12.
+
+    INPS: max(obbligo da F(Y−1), minimale INPS anno corrente)
+    IR: solo obbligo da F(Y−1)
+    """
 
     reference_year: int  # anno in cui si accantona (anno corrente)
     source_year: int  # anno fatturato che determina l'obbligo (Y-1)
-    inps_annual: float
+    inps_from_prev: float  # saldo+acconto INPS su F(Y-1)
+    inps_minimale: float  # inps_min_base × rate × (1−sconto), quote anno corrente
+    inps_annual: float  # max(from_prev, minimale) — base usata per /12
     ir_annual: float
     inps_month: float
     ir_month: float
     annual: AnnualTax
+    used_minimale: bool
 
 
 @dataclass(frozen=True)
@@ -195,28 +203,50 @@ def annual_taxes(
     )
 
 
+def inps_minimale_annuo(quotas: Quotas) -> float:
+    """INPS annuale sul minimale: min_base × aliquota × (1 − sconto)."""
+    if quotas.inps_min_base is None or quotas.inps_min_base <= 0:
+        return 0.0
+    return (
+        float(quotas.inps_min_base)
+        * float(quotas.inps_rate)
+        * (1.0 - float(quotas.inps_discount_rate))
+    )
+
+
 def certain_reserve(
     current_year: int,
     fatturato_by_year: Mapping[int, float],
     quotas_for_source_year: Quotas,
+    quotas_for_current_year: Optional[Quotas] = None,
 ) -> CertainReserve:
     """
-    Riserva certa per l'anno corrente: obblighi determinati dal fatturato
-    dell'anno precedente (saldo su surplus + acconto), divisi per 12.
+    Riserva certa per l'anno corrente, divisa per 12.
+
+    - INPS: max(obbligo da F(Y−1), minimale INPS con quote dell'anno corrente)
+    - IR: solo obbligo da F(Y−1) (saldo surplus + acconto)
     """
+    quotas_cur = quotas_for_current_year or quotas_for_source_year
     source_year = current_year - 1
     f_src = float(fatturato_by_year.get(source_year, 0.0))
     f_prev = float(fatturato_by_year.get(source_year - 1, 0.0))
     ann = annual_taxes(source_year, f_src, f_prev, quotas_for_source_year)
+    inps_from_prev = float(ann.inps_totale)
+    inps_min = inps_minimale_annuo(quotas_cur)
+    inps_annual = max(inps_from_prev, inps_min)
+    ir_annual = float(ann.ir_totale)
     n = float(CERTAIN_RESERVE_MONTHS)
     return CertainReserve(
         reference_year=current_year,
         source_year=source_year,
-        inps_annual=ann.inps_totale,
-        ir_annual=ann.ir_totale,
-        inps_month=ann.inps_totale / n,
-        ir_month=ann.ir_totale / n,
+        inps_from_prev=inps_from_prev,
+        inps_minimale=inps_min,
+        inps_annual=inps_annual,
+        ir_annual=ir_annual,
+        inps_month=inps_annual / n,
+        ir_month=ir_annual / n,
         annual=ann,
+        used_minimale=inps_annual > inps_from_prev + 1e-9,
     )
 
 

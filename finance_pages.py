@@ -1406,11 +1406,14 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
     all_inv = list_invoices_lordo_all()
     var_by_id = _invoice_variable_reserves(all_inv, quotas_map)
 
-    # Riserva certa: obblighi da fatturato Y-1, quote di Y-1 (fallback Y)
+    # Riserva certa: F(Y-1) con quote Y-1; minimale INPS con quote Y
     source_quotas = quotas_map.get(year - 1) or quotas_map.get(year)
+    current_quotas = quotas_map.get(year) or source_quotas
     certa = None
     if source_quotas is not None:
-        certa = certain_reserve(year, fatturato_anni, source_quotas)
+        certa = certain_reserve(
+            year, fatturato_anni, source_quotas, current_quotas
+        )
 
     total_lordo = 0.0
     var_inps = 0.0
@@ -1565,11 +1568,12 @@ def total_ancora_prelevabile() -> float:
 
     certa_by_year: dict[int, tuple[float, float]] = {}
     for y in years:
-        q = quotas_map.get(y - 1) or quotas_map.get(y)
-        if q is None:
+        q_src = quotas_map.get(y - 1) or quotas_map.get(y)
+        q_cur = quotas_map.get(y) or q_src
+        if q_src is None:
             certa_by_year[y] = (0.0, 0.0)
             continue
-        cr = certain_reserve(y, fatturato_anni, q)
+        cr = certain_reserve(y, fatturato_anni, q_src, q_cur)
         certa_by_year[y] = (cr.inps_month, cr.ir_month)
 
     keys = set(month_lordo) | set(month_ena) | set(month_wd)
@@ -1597,9 +1601,9 @@ def total_ancora_prelevabile() -> float:
 def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
-        "Accantonamento: riserva certa (obblighi da anno precedente ÷ "
-        f"{CERTAIN_RESERVE_MONTHS}) + riserva variabile su ogni fattura "
-        "(soglia minimale INPS) + enasarco."
+        "Accantonamento: riserva certa (INPS = max(obbligo F(Y−1), "
+        f"minimale) ÷ {CERTAIN_RESERVE_MONTHS}; IR da F(Y−1)) + "
+        "riserva variabile su ogni fattura (soglia minimale) + enasarco."
     )
 
     periods = list_competence_periods()
@@ -1662,12 +1666,19 @@ def page_contabilita_mensile() -> None:
     quotas_by_year: dict[int, Quotas] = fig["quotas_by_year"]
 
     if certa is not None:
+        floor_note = (
+            f"minimale {_fmt_euro(certa.inps_minimale)}"
+            if certa.used_minimale
+            else f"da F({certa.source_year}) {_fmt_euro(certa.inps_from_prev)}"
+        )
         det_certa_inps = (
-            f"Obbligo INPS da fatturato {certa.source_year}: "
-            f"{_fmt_euro(certa.inps_annual)} ÷ {CERTAIN_RESERVE_MONTHS} "
+            f"max(F({certa.source_year}) {_fmt_euro(certa.inps_from_prev)}, "
+            f"minimale {_fmt_euro(certa.inps_minimale)}) "
+            f"= {_fmt_euro(certa.inps_annual)} ÷ {CERTAIN_RESERVE_MONTHS} "
             f"= {_fmt_euro(certa_inps)} "
-            f"(saldo {_fmt_euro(certa.annual.inps_saldo)} + "
-            f"acconto {_fmt_euro(certa.annual.inps_acconto)})"
+            f"(usato: {floor_note}; saldo "
+            f"{_fmt_euro(certa.annual.inps_saldo)} + acconto "
+            f"{_fmt_euro(certa.annual.inps_acconto)})"
         )
         det_certa_ir = (
             f"Obbligo IR da fatturato {certa.source_year}: "
