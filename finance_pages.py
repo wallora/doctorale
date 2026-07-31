@@ -556,6 +556,153 @@ def withdrawals_by_month() -> dict[tuple[int, int], float]:
     }
 
 
+def fatturato_by_competence_month() -> dict[tuple[int, int], float]:
+    """Lordo senza enasarco per mese di competenza (reference_year/month)."""
+    df = _read_df(
+        """
+        SELECT
+            i.reference_year AS y,
+            i.reference_month AS m,
+            COALESCE(
+                SUM(l.amount) FILTER (
+                    WHERE l.line_type IS DISTINCT FROM 'enasarco'
+                ),
+                0
+            ) AS fatturato
+        FROM invoices i
+        LEFT JOIN invoice_lines l ON l.invoice_id = i.id
+        WHERE i.reference_year IS NOT NULL
+          AND i.reference_month IS NOT NULL
+        GROUP BY 1, 2
+        """
+    )
+    if df.empty:
+        return {}
+    return {
+        (int(r.y), int(r.m)): float(r.fatturato)
+        for r in df.itertuples(index=False)
+        if r.y is not None and r.m is not None
+    }
+
+
+def fatturato_by_collection_month() -> dict[tuple[int, int], float]:
+    """Lordo senza enasarco per mese di incasso (payment_date)."""
+    df = _read_df(
+        """
+        SELECT
+            EXTRACT(YEAR FROM i.payment_date)::INTEGER AS y,
+            EXTRACT(MONTH FROM i.payment_date)::INTEGER AS m,
+            COALESCE(
+                SUM(l.amount) FILTER (
+                    WHERE l.line_type IS DISTINCT FROM 'enasarco'
+                ),
+                0
+            ) AS fatturato
+        FROM invoices i
+        LEFT JOIN invoice_lines l ON l.invoice_id = i.id
+        WHERE i.payment_date IS NOT NULL
+        GROUP BY 1, 2
+        """
+    )
+    if df.empty:
+        return {}
+    return {
+        (int(r.y), int(r.m)): float(r.fatturato)
+        for r in df.itertuples(index=False)
+        if r.y is not None and r.m is not None
+    }
+
+
+def list_annual_chart_years() -> list[int]:
+    """Anni disponibili per il grafico annuale."""
+    years: set[int] = set()
+    for mapping in (
+        fatturato_by_competence_month(),
+        fatturato_by_collection_month(),
+        enasarco_by_collection_month(),
+        withdrawals_by_month(),
+    ):
+        for y, _m in mapping:
+            years.add(int(y))
+    quotas = list_year_quotas()
+    if not quotas.empty:
+        years.update(int(y) for y in quotas["year"].tolist())
+    return sorted(years, reverse=True)
+
+
+ANNUAL_METRICS = [
+    ("fatturato_competenza", "Fatturato (competenza)"),
+    ("fatturato_cassa", "Fatturato (cassa)"),
+    ("enasarco", "Enasarco"),
+    ("netto", "Netto"),
+    ("prelievi", "Prelievi"),
+    ("accantonamenti", "Accantonamenti"),
+]
+
+
+def _months_vector_from_map(
+    month_map: dict[tuple[int, int], float], year: int
+) -> list[float]:
+    return [float(month_map.get((year, m), 0.0)) for m in range(1, 13)]
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def annual_metrics_by_year() -> dict[str, dict[int, list[float]]]:
+    """
+    Metriche mensili (gen–dic) per anno.
+
+    Enasarco / Accantonamenti / Netto = cassa (payment_date).
+    Fatturato disponibile in competenza e cassa.
+    Netto = fatturato cassa − enasarco − accantonamenti (prima dei prelievi).
+    Accantonamenti = riserve su fatture + INPS fissa / 12 ogni mese.
+    """
+    quotas_map = _load_quotas_map()
+    fatturato_anni = fatturato_by_attribution_year()
+    all_inv = list_invoices_lordo_all()
+    res_by_id = _invoice_reserves(all_inv, quotas_map, fatturato_anni)
+
+    fat_comp = fatturato_by_competence_month()
+    fat_cassa = fatturato_by_collection_month()
+    ena_raw = enasarco_by_collection_month()
+    # Costo enasarco positivo (le voci in DB sono di solito negative)
+    ena_cost = {k: -float(v) for k, v in ena_raw.items()}
+    prelievi = withdrawals_by_month()
+
+    month_acc_inv: dict[tuple[int, int], float] = {}
+    if not all_inv.empty:
+        for r in all_inv.itertuples(index=False):
+            key = attribution_year_month(r.issue_date, r.payment_date)
+            if key is None:
+                continue
+            res = res_by_id.get(int(r.id))
+            if res is not None:
+                month_acc_inv[key] = month_acc_inv.get(key, 0.0) + res.totale
+
+    years: set[int] = set()
+    for mapping in (fat_comp, fat_cassa, ena_cost, prelievi, month_acc_inv):
+        for y, _m in mapping:
+            years.add(int(y))
+    years.update(quotas_map.keys())
+
+    out: dict[str, dict[int, list[float]]] = {
+        key: {} for key, _ in ANNUAL_METRICS
+    }
+    for y in years:
+        fissa = fixed_inps_month(quotas_map[y]) if y in quotas_map else 0.0
+        fat_c = _months_vector_from_map(fat_cassa, y)
+        ena = _months_vector_from_map(ena_cost, y)
+        acc_inv = _months_vector_from_map(month_acc_inv, y)
+        acc = [acc_inv[i] + fissa for i in range(12)]
+        netto = [fat_c[i] - ena[i] - acc[i] for i in range(12)]
+        out["fatturato_competenza"][y] = _months_vector_from_map(fat_comp, y)
+        out["fatturato_cassa"][y] = fat_c
+        out["enasarco"][y] = ena
+        out["prelievi"][y] = _months_vector_from_map(prelievi, y)
+        out["accantonamenti"][y] = acc
+        out["netto"][y] = netto
+    return out
+
+
 def list_enasarco_lines_for_collection(year: int, month: int) -> pd.DataFrame:
     """Voci enasarco sulle fatture di saldo incassate nel mese."""
     sql = """
@@ -1321,7 +1468,7 @@ def page_quote_annuali() -> None:
             submitted = st.form_submit_button("Salva aliquote", type="primary")
             if submitted:
                 upsert_year_quota(int(year_input), values)
-                total_ancora_prelevabile.clear()
+                _clear_finance_caches()
                 st.session_state[form_key] = False
                 st.success(f"Aliquote {int(year_input)} salvate.")
                 st.rerun()
@@ -1553,6 +1700,11 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
         "attr_years_used": attr_years_used,
         "fatturato_anni": fatturato_anni,
     }
+
+
+def _clear_finance_caches() -> None:
+    total_ancora_prelevabile.clear()
+    annual_metrics_by_year.clear()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -1820,7 +1972,7 @@ def page_contabilita_mensile() -> None:
                     },
                     withdrawal_id=withdrawal_id,
                 )
-                total_ancora_prelevabile.clear()
+                _clear_finance_caches()
                 st.session_state[form_key] = False
                 st.success("Prelievo salvato.")
                 st.rerun()
@@ -1836,7 +1988,7 @@ def page_contabilita_mensile() -> None:
                 key=f"mwd_del_{year}_{month}_{withdrawal_id}",
             ):
                 delete_withdrawal(withdrawal_id)
-                total_ancora_prelevabile.clear()
+                _clear_finance_caches()
                 st.success("Prelievo eliminato.")
                 st.rerun()
 
@@ -1858,3 +2010,71 @@ def page_contabilita_mensile() -> None:
         "Netto = lordo netto enasarco − da accantonare · "
         "Netto residuo = netto − prelievi."
     )
+
+
+def page_contabilita_annuale() -> None:
+    st.subheader("Contabilità annuale")
+    st.caption(
+        "Grafico gen–dic. Fatturato disponibile in competenza o cassa; "
+        "Enasarco, Accantonamenti e Netto sono in cassa (data pagamento). "
+        "Netto = fatturato cassa − enasarco − accantonamenti (prima dei prelievi)."
+    )
+
+    years = list_annual_chart_years()
+    if not years:
+        st.info("Nessun dato contabile da rappresentare.")
+        return
+
+    metrics = annual_metrics_by_year()
+    metric_labels = {k: lab for k, lab in ANNUAL_METRICS}
+
+    selected_years = st.multiselect(
+        "Anni",
+        options=years,
+        default=[years[0]],
+        key="fin_annual_years",
+    )
+    if not selected_years:
+        st.info("Seleziona almeno un anno.")
+        return
+
+    st.markdown("##### Voci da mostrare")
+    series_specs: list[tuple[int, str]] = []
+    cols = st.columns(min(len(selected_years), 4))
+    for i, y in enumerate(selected_years):
+        with cols[i % len(cols)]:
+            st.markdown(f"**{y}**")
+            for key, label in ANNUAL_METRICS:
+                if st.checkbox(
+                    label,
+                    key=f"fin_annual_{y}_{key}",
+                    value=(key == "fatturato_cassa" and y == selected_years[0]),
+                ):
+                    series_specs.append((y, key))
+
+    if not series_specs:
+        st.info("Seleziona almeno una voce.")
+        return
+
+    month_labels = [_month_label(m) for m in range(1, 13)]
+    chart_data: dict[str, list[float]] = {}
+    for y, key in series_specs:
+        label = f"{y} · {metric_labels[key]}"
+        values = metrics.get(key, {}).get(y)
+        if values is None:
+            values = [0.0] * 12
+        chart_data[label] = values
+
+    chart_df = pd.DataFrame(chart_data, index=month_labels)
+    st.line_chart(chart_df, width="stretch")
+
+    with st.expander("Dati tabellari", expanded=False):
+        col_config = {
+            c: st.column_config.NumberColumn(c, format="€ %.2f")
+            for c in chart_df.columns
+        }
+        st.dataframe(
+            chart_df,
+            width="stretch",
+            column_config=col_config,
+        )

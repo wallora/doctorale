@@ -36,6 +36,7 @@ from finance_pages import (
     page_elenco_prelievi,
     page_quote_annuali,
     page_contabilita_mensile,
+    page_contabilita_annuale,
 )
 
 # ---------------------------------------------------------------------------
@@ -2283,6 +2284,7 @@ def main() -> None:
                 "Funzioni contabilità",
                 options=[
                     "Contabilità mensile",
+                    "Contabilità annuale",
                     "Elenco Fatture",
                     "Elenco pagamenti",
                     "Elenco prelievi",
@@ -2308,6 +2310,8 @@ def main() -> None:
             page_quote_annuali()
         elif pagina_contab == "Elenco Fatture":
             page_elenco_fatture()
+        elif pagina_contab == "Contabilità annuale":
+            page_contabilita_annuale()
         else:
             page_contabilita_mensile()
     elif sezione == "Dati":
