@@ -1,0 +1,31 @@
+name: Payment reminders
+
+on:
+  schedule:
+    # Ogni giorno alle 07:00 UTC (~09:00 Italia in estate)
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Send reminders
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          REMINDER_TO: ${{ secrets.REMINDER_TO }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: python scripts/send_payment_reminders.py

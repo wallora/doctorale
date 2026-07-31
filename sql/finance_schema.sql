@@ -95,6 +95,14 @@ CREATE TABLE IF NOT EXISTS tax_payments (
 CREATE INDEX IF NOT EXISTS tax_payments_year_idx
     ON tax_payments (reference_year);
 
+-- Promemoria email già inviati (anti-doppio per soglia 15g / 7g)
+CREATE TABLE IF NOT EXISTS payment_reminders_sent (
+    payment_id BIGINT NOT NULL REFERENCES tax_payments(id) ON DELETE CASCADE,
+    days_before INTEGER NOT NULL CHECK (days_before > 0),
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (payment_id, days_before)
+);
+
 CREATE TABLE IF NOT EXISTS withdrawals (
     id BIGSERIAL PRIMARY KEY,
     withdrawal_date DATE,
@@ -133,4 +141,5 @@ ALTER TABLE year_quotas ENABLE ROW LEVEL SECURITY;
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE invoice_lines ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tax_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payment_reminders_sent ENABLE ROW LEVEL SECURITY;
 ALTER TABLE withdrawals ENABLE ROW LEVEL SECURITY;
