@@ -13,7 +13,8 @@
 
 CREATE TABLE IF NOT EXISTS year_quotas (
     year INTEGER PRIMARY KEY,
-    tax_exempt_rate NUMERIC(12, 8) NOT NULL DEFAULT 0,
+    -- Coefficiente di imponibilità sul fatturato (es. 0.62 forfettario)
+    imponibile_rate NUMERIC(12, 8) NOT NULL DEFAULT 0.62,
     inps_discount_rate NUMERIC(12, 8) NOT NULL DEFAULT 0,
     inps_rate NUMERIC(12, 8) NOT NULL DEFAULT 0,
     enasarco_rate NUMERIC(12, 8) NOT NULL DEFAULT 0,

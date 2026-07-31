@@ -203,9 +203,16 @@ def migrate_year_quotas(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int
     n = 0
     for doc_id, data in rows:
         year = year_from_doc(doc_id, data.get("year"))
+        # Firebase taxExemptRate era la quota esente → imponibile = 1 − esente
+        if data.get("taxExemptRate") is not None:
+            imponibile = (Decimal("1") - rate(data.get("taxExemptRate"))).quantize(
+                Decimal("0.00000001")
+            )
+        else:
+            imponibile = Decimal("0.62")
         payload = {
             "year": year,
-            "tax_exempt_rate": rate(data.get("taxExemptRate")),
+            "imponibile_rate": imponibile,
             "inps_discount_rate": rate(data.get("inpsDiscountRate")),
             "inps_rate": rate(data.get("inpsRate")),
             "enasarco_rate": rate(data.get("enasarcoRate")),
@@ -218,24 +225,25 @@ def migrate_year_quotas(cur, rows: list[tuple[str, dict]], dry_run: bool) -> int
         }
         print(
             f"  year_quotas {doc_id} → year={year} "
+            f"imponibile={payload['imponibile_rate']} "
             f"enasarco={payload['enasarco_rate']} max={payload['enasarco_max']}"
         )
         if not dry_run:
             cur.execute(
                 """
                 INSERT INTO year_quotas (
-                    year, tax_exempt_rate, inps_discount_rate, inps_rate,
+                    year, imponibile_rate, inps_discount_rate, inps_rate,
                     enasarco_rate, enasarco_max, inps_min_base, income_tax_rate,
                     inps_advance_rate, income_tax_advance_rate, firebase_id,
                     updated_at
                 ) VALUES (
-                    %(year)s, %(tax_exempt_rate)s, %(inps_discount_rate)s, %(inps_rate)s,
+                    %(year)s, %(imponibile_rate)s, %(inps_discount_rate)s, %(inps_rate)s,
                     %(enasarco_rate)s, %(enasarco_max)s, %(inps_min_base)s, %(income_tax_rate)s,
                     %(inps_advance_rate)s, %(income_tax_advance_rate)s, %(firebase_id)s,
                     NOW()
                 )
                 ON CONFLICT (year) DO UPDATE SET
-                    tax_exempt_rate = EXCLUDED.tax_exempt_rate,
+                    imponibile_rate = EXCLUDED.imponibile_rate,
                     inps_discount_rate = EXCLUDED.inps_discount_rate,
                     inps_rate = EXCLUDED.inps_rate,
                     enasarco_rate = EXCLUDED.enasarco_rate,
