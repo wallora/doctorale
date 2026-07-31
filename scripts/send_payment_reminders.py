@@ -16,12 +16,15 @@ from __future__ import annotations
 import os
 import smtplib
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import psycopg2.extras
+
+LOCAL_TZ = ZoneInfo("Europe/Rome")
 
 TAX_TYPE_LABELS = {
     "inps": "INPS",
@@ -162,9 +165,15 @@ def main() -> None:
     mail_from = (os.environ.get("SMTP_FROM") or smtp_user).strip()
     days_list = _parse_days(os.environ.get("REMINDER_DAYS") or "15,7")
 
-    today = date.today()
+    now_local = datetime.now(LOCAL_TZ)
+    today = now_local.date()
     sent_mails = 0
     marked = 0
+    print(
+        f"oggi={today} tz=Europe/Rome "
+        f"utc={datetime.now(timezone.utc).isoformat()} "
+        f"soglie={days_list}"
+    )
 
     conn = psycopg2.connect(database_url)
     try:
