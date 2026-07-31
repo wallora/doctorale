@@ -2200,12 +2200,16 @@ def page_contabilita_annuale() -> None:
         "Totali annuali. Enasarco e riserve in cassa. "
         "Netto = fatturato cassa − enasarco − INPS/IR acconto e saldo − INPS fissa "
         "(dal primo mese di attività al mese corrente, anche mesi magri), "
-        "prima dei prelievi."
+        "prima dei prelievi. "
+        "Netto residuo = Netto − Prelievi (stesso concetto del totale ancora prelevabile)."
     )
     totals = annual_totals_by_year()
     detail_rows = []
+    residuo_totale = 0.0
     for y in sorted(totals.keys(), reverse=True):
         t = totals[y]
+        residuo = float(t["netto"]) - float(t["prelievi"])
+        residuo_totale += residuo
         detail_rows.append(
             {
                 "Anno": y,
@@ -2219,8 +2223,13 @@ def page_contabilita_annuale() -> None:
                 "INPS fissa": t["inps_fissa"],
                 "Netto": t["netto"],
                 "Prelievi": t["prelievi"],
+                "Netto residuo": residuo,
             }
         )
+    _colored_amount_box(
+        "Totale ancora prelevabile (somma netti residui annuali)",
+        residuo_totale,
+    )
     detail_df = pd.DataFrame(detail_rows)
     money_cols = [c for c in detail_df.columns if c != "Anno"]
     st.dataframe(
