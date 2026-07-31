@@ -1030,56 +1030,50 @@ def page_elenco_pagamenti() -> None:
         "paid": False,
     }
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        tax_type = st.selectbox(
-            "Tipo",
-            options=TAX_TYPE_OPTIONS,
-            format_func=lambda k: TAX_TYPE_LABELS[k],
-            index=TAX_TYPE_OPTIONS.index(defaults["type"])
-            if defaults.get("type") in TAX_TYPE_OPTIONS
-            else 0,
-            key=f"tax_type_{payment_id or 'new'}",
-        )
-    with c2:
-        ref_year = st.number_input(
-            "Anno competenza",
-            min_value=2000,
-            max_value=2100,
-            value=int(defaults["reference_year"]),
-            key=f"tax_year_{payment_id or 'new'}",
-        )
-    with c3:
-        payment_date = st.date_input(
-            "Data pagamento",
-            value=defaults.get("payment_date") or date.today(),
-            key=f"tax_date_{payment_id or 'new'}",
-        )
+    with st.form(f"tax_form_{payment_id or 'new'}", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            tax_type = st.selectbox(
+                "Tipo",
+                options=TAX_TYPE_OPTIONS,
+                format_func=lambda k: TAX_TYPE_LABELS[k],
+                index=TAX_TYPE_OPTIONS.index(defaults["type"])
+                if defaults.get("type") in TAX_TYPE_OPTIONS
+                else 0,
+            )
+        with c2:
+            ref_year = st.number_input(
+                "Anno competenza",
+                min_value=2000,
+                max_value=2100,
+                value=int(defaults["reference_year"]),
+            )
+        with c3:
+            payment_date = st.date_input(
+                "Data pagamento",
+                value=defaults.get("payment_date") or date.today(),
+            )
 
-    description = st.text_input(
-        "Descrizione",
-        value=defaults.get("description") or "",
-        key=f"tax_desc_{payment_id or 'new'}",
-    )
-    a1, a2 = st.columns(2)
-    with a1:
-        amount = st.number_input(
-            "Importo (€)",
-            value=_money(defaults.get("amount")),
-            step=0.01,
-            format="%.2f",
-            key=f"tax_amt_{payment_id or 'new'}",
+        description = st.text_input(
+            "Descrizione",
+            value=defaults.get("description") or "",
         )
-    with a2:
-        paid = st.checkbox(
-            "Pagato",
-            value=bool(defaults.get("paid")),
-            key=f"tax_paid_{payment_id or 'new'}",
-        )
+        a1, a2 = st.columns(2)
+        with a1:
+            amount = st.number_input(
+                "Importo (€)",
+                value=_money(defaults.get("amount")),
+                step=0.01,
+                format="%.2f",
+            )
+        with a2:
+            paid = st.checkbox(
+                "Pagato",
+                value=bool(defaults.get("paid")),
+            )
 
-    b1, b2, _ = st.columns([1, 1, 2])
-    with b1:
-        if st.button("Salva", type="primary", key=f"tax_save_{payment_id or 'new'}"):
+        saved = st.form_submit_button("Salva", type="primary")
+        if saved:
             upsert_tax_payment(
                 {
                     "type": tax_type,
@@ -1093,19 +1087,19 @@ def page_elenco_pagamenti() -> None:
             )
             st.success("Pagamento salvato.")
             st.rerun()
-    with b2:
-        if payment_id is not None:
-            confirm = st.checkbox(
-                "Conferma eliminazione", key=f"tax_del_confirm_{payment_id}"
-            )
-            if st.button(
-                "Elimina",
-                disabled=not confirm,
-                key=f"tax_del_{payment_id}",
-            ):
-                delete_tax_payment(payment_id)
-                st.success("Pagamento eliminato.")
-                st.rerun()
+
+    if payment_id is not None:
+        confirm = st.checkbox(
+            "Conferma eliminazione", key=f"tax_del_confirm_{payment_id}"
+        )
+        if st.button(
+            "Elimina",
+            disabled=not confirm,
+            key=f"tax_del_{payment_id}",
+        ):
+            delete_tax_payment(payment_id)
+            st.success("Pagamento eliminato.")
+            st.rerun()
 
 
 def page_elenco_prelievi() -> None:
@@ -1156,46 +1150,41 @@ def page_elenco_prelievi() -> None:
         "description": "",
     }
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ref_year = st.number_input(
-            "Anno",
-            min_value=2000,
-            max_value=2100,
-            value=int(defaults["reference_year"]),
-            key=f"wd_year_{withdrawal_id or 'new'}",
+    with st.form(f"wd_form_{withdrawal_id or 'new'}", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            ref_year = st.number_input(
+                "Anno",
+                min_value=2000,
+                max_value=2100,
+                value=int(defaults["reference_year"]),
+            )
+        with c2:
+            ref_month = st.selectbox(
+                "Mese",
+                options=list(range(1, 13)),
+                format_func=_month_label,
+                index=int(defaults["reference_month"]) - 1,
+            )
+        with c3:
+            withdrawal_date = st.date_input(
+                "Data prelievo",
+                value=defaults.get("withdrawal_date") or date.today(),
+            )
+
+        amount = st.number_input(
+            "Importo (€)",
+            value=_money(defaults.get("amount")),
+            step=0.01,
+            format="%.2f",
         )
-    with c2:
-        ref_month = st.selectbox(
-            "Mese",
-            options=list(range(1, 13)),
-            format_func=_month_label,
-            index=int(defaults["reference_month"]) - 1,
-            key=f"wd_month_{withdrawal_id or 'new'}",
-        )
-    with c3:
-        withdrawal_date = st.date_input(
-            "Data prelievo",
-            value=defaults.get("withdrawal_date") or date.today(),
-            key=f"wd_date_{withdrawal_id or 'new'}",
+        description = st.text_input(
+            "Descrizione",
+            value=defaults.get("description") or "",
         )
 
-    amount = st.number_input(
-        "Importo (€)",
-        value=_money(defaults.get("amount")),
-        step=0.01,
-        format="%.2f",
-        key=f"wd_amt_{withdrawal_id or 'new'}",
-    )
-    description = st.text_input(
-        "Descrizione",
-        value=defaults.get("description") or "",
-        key=f"wd_desc_{withdrawal_id or 'new'}",
-    )
-
-    b1, b2, _ = st.columns([1, 1, 2])
-    with b1:
-        if st.button("Salva", type="primary", key=f"wd_save_{withdrawal_id or 'new'}"):
+        saved = st.form_submit_button("Salva", type="primary")
+        if saved:
             upsert_withdrawal(
                 {
                     "withdrawal_date": withdrawal_date,
@@ -1208,132 +1197,136 @@ def page_elenco_prelievi() -> None:
             )
             st.success("Prelievo salvato.")
             st.rerun()
-    with b2:
-        if withdrawal_id is not None:
-            confirm = st.checkbox(
-                "Conferma eliminazione", key=f"wd_del_confirm_{withdrawal_id}"
-            )
-            if st.button(
-                "Elimina",
-                disabled=not confirm,
-                key=f"wd_del_{withdrawal_id}",
-            ):
-                delete_withdrawal(withdrawal_id)
-                st.success("Prelievo eliminato.")
-                st.rerun()
+
+    if withdrawal_id is not None:
+        confirm = st.checkbox(
+            "Conferma eliminazione", key=f"wd_del_confirm_{withdrawal_id}"
+        )
+        if st.button(
+            "Elimina",
+            disabled=not confirm,
+            key=f"wd_del_{withdrawal_id}",
+        ):
+            delete_withdrawal(withdrawal_id)
+            st.success("Prelievo eliminato.")
+            st.rerun()
 
 
 def page_quote_annuali() -> None:
     st.subheader("Aliquote")
 
-    form_key = "fin_quota_form_open"
-    if form_key not in st.session_state:
-        st.session_state[form_key] = False
+    @st.fragment
+    def _aliquote_body() -> None:
+        form_key = "fin_quota_form_open"
+        if form_key not in st.session_state:
+            st.session_state[form_key] = False
 
-    h1, h2 = st.columns([6, 1])
-    with h1:
-        st.markdown("##### Elenco aliquote")
-    with h2:
-        if st.button(
-            "−" if st.session_state[form_key] else "+",
-            key="fin_quota_form_toggle",
-            help="Mostra/nascondi nuova aliquota",
-        ):
-            st.session_state[form_key] = not st.session_state[form_key]
-            st.rerun()
+        h1, h2 = st.columns([6, 1])
+        with h1:
+            st.markdown("##### Elenco aliquote")
+        with h2:
+            if st.button(
+                "−" if st.session_state[form_key] else "+",
+                key="fin_quota_form_toggle",
+                help="Mostra/nascondi nuova aliquota",
+            ):
+                st.session_state[form_key] = not st.session_state[form_key]
+                # Il click sul bottone riesegue già il fragment: niente st.rerun()
 
-    df = list_year_quotas()
-    if df.empty:
-        st.info("Nessuna aliquota. Premi + per crearne una.")
-        selected_year = None
-    else:
-        display = pd.DataFrame(
-            {
-                "Anno": df["year"].astype(int),
-                "Imponibile": df["imponibile_rate"].map(_fmt_pct),
-                "INPS": df["inps_rate"].map(_fmt_pct),
-                "Sconto INPS": df["inps_discount_rate"].map(_fmt_pct),
-                "Enasarco": df["enasarco_rate"].map(_fmt_pct),
-                "Max Enasarco": df["enasarco_max"].map(_fmt_euro),
-                "Min. INPS": df["inps_min_base"].map(_fmt_euro),
-                "Imposte": df["income_tax_rate"].map(_fmt_pct),
-            }
+        df = list_year_quotas()
+        if df.empty:
+            st.info("Nessuna aliquota. Premi + per crearne una.")
+            selected_year = None
+        else:
+            display = pd.DataFrame(
+                {
+                    "Anno": df["year"].astype(int),
+                    "Imponibile": df["imponibile_rate"].map(_fmt_pct),
+                    "INPS": df["inps_rate"].map(_fmt_pct),
+                    "Sconto INPS": df["inps_discount_rate"].map(_fmt_pct),
+                    "Enasarco": df["enasarco_rate"].map(_fmt_pct),
+                    "Max Enasarco": df["enasarco_max"].map(_fmt_euro),
+                    "Min. INPS": df["inps_min_base"].map(_fmt_euro),
+                    "Imposte": df["income_tax_rate"].map(_fmt_pct),
+                }
+            )
+            event = st.dataframe(
+                display,
+                width="stretch",
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="fin_quota_table",
+            )
+            selected = event.selection.rows if event and event.selection else []
+            selected_year = (
+                int(df.iloc[selected[0]]["year"]) if selected else None
+            )
+
+        show_form = st.session_state[form_key] or selected_year is not None
+        if not show_form:
+            return
+
+        st.markdown("---")
+        if selected_year is not None:
+            st.markdown(f"##### Modifica aliquote {selected_year}")
+            quota = get_year_quota(selected_year) or {}
+            year_value = selected_year
+            year_locked = True
+        else:
+            st.markdown("##### Nuova aliquota")
+            quota = {}
+            year_value = date.today().year
+            year_locked = False
+
+        key_prefix = (
+            f"quota_edit_{year_value}" if year_locked else "quota_new"
         )
-        event = st.dataframe(
-            display,
-            width="stretch",
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="fin_quota_table",
-        )
-        selected = event.selection.rows if event and event.selection else []
-        selected_year = int(df.iloc[selected[0]]["year"]) if selected else None
-
-    show_form = st.session_state[form_key] or selected_year is not None
-    if not show_form:
-        return
-
-    st.markdown("---")
-    if selected_year is not None:
-        st.markdown(f"##### Modifica aliquote {selected_year}")
-        quota = get_year_quota(selected_year) or {}
-        year_value = selected_year
-        year_locked = True
-    else:
-        st.markdown("##### Nuova aliquota")
-        quota = {}
-        year_value = date.today().year
-        year_locked = False
-
-    if year_locked:
-        st.caption(f"Anno: **{year_value}**")
-        year_input = year_value
-    else:
-        year_input = st.number_input(
-            "Anno",
-            min_value=2000,
-            max_value=2100,
-            value=year_value,
-            key="quota_year_new",
-        )
-
-    values: dict[str, Any] = {}
-    cols = st.columns(2)
-    # Key separate per nuovo vs modifica: altrimenti aprendo la pagina (anno
-    # corrente a 0) e poi selezionando lo stesso anno i widget restano a 0.
-    key_prefix = (
-        f"quota_edit_{year_input}" if year_locked else "quota_new"
-    )
-    for i, (field, label, kind) in enumerate(QUOTA_FIELDS):
-        with cols[i % 2]:
-            raw = quota.get(field)
-            if kind == "rate":
-                # UI in percentuale per comodità
-                pct_default = float(raw) * 100 if raw is not None else 0.0
-                pct = st.number_input(
-                    label + " (%)",
-                    value=float(pct_default),
-                    step=0.01,
-                    format="%.4f",
-                    key=f"{key_prefix}_{field}",
-                )
-                values[field] = float(pct) / 100.0
+        with st.form(f"quota_form_{key_prefix}", clear_on_submit=False):
+            if year_locked:
+                st.caption(f"Anno: **{year_value}**")
+                year_input = year_value
             else:
-                values[field] = st.number_input(
-                    label,
-                    value=_money(raw) if raw is not None else 0.0,
-                    step=0.01,
-                    format="%.2f",
-                    key=f"{key_prefix}_{field}",
+                year_input = st.number_input(
+                    "Anno",
+                    min_value=2000,
+                    max_value=2100,
+                    value=year_value,
                 )
 
-    if st.button("Salva aliquote", type="primary", key=f"quota_save_{year_input}"):
-        upsert_year_quota(int(year_input), values)
-        total_ancora_prelevabile.clear()
-        st.session_state[form_key] = False
-        st.success(f"Aliquote {int(year_input)} salvate.")
-        st.rerun()
+            values: dict[str, Any] = {}
+            cols = st.columns(2)
+            for i, (field, label, kind) in enumerate(QUOTA_FIELDS):
+                with cols[i % 2]:
+                    raw = quota.get(field)
+                    if kind == "rate":
+                        pct_default = (
+                            float(raw) * 100 if raw is not None else 0.0
+                        )
+                        pct = st.number_input(
+                            label + " (%)",
+                            value=float(pct_default),
+                            step=0.01,
+                            format="%.4f",
+                        )
+                        values[field] = float(pct) / 100.0
+                    else:
+                        values[field] = st.number_input(
+                            label,
+                            value=_money(raw) if raw is not None else 0.0,
+                            step=0.01,
+                            format="%.2f",
+                        )
+
+            submitted = st.form_submit_button("Salva aliquote", type="primary")
+            if submitted:
+                upsert_year_quota(int(year_input), values)
+                total_ancora_prelevabile.clear()
+                st.session_state[form_key] = False
+                st.success(f"Aliquote {int(year_input)} salvate.")
+                st.rerun()
+
+    _aliquote_body()
 
 
 def _load_quotas_map() -> dict[int, Quotas]:
@@ -1633,7 +1626,6 @@ def page_contabilita_mensile() -> None:
     year, month = periods[labels.index(choice)]
 
     fig = compute_month_figures(year, month)
-    withdrawals_df = fig["withdrawals_df"]
     missing_quotas: set[int] = fig["missing_quotas"]
     inps_fissa = float(fig["inps_fissa"])
     inps_min_annuo = float(fig["inps_min_annuo"])
@@ -1720,63 +1712,75 @@ def page_contabilita_mensile() -> None:
         "Indipendente dal fatturato: dovuta ogni mese anche senza incassi."
     )
 
-    form_key = f"fin_month_wd_form_open_{year}_{month}"
-    if form_key not in st.session_state:
-        st.session_state[form_key] = False
+    @st.fragment
+    def _prelievi_mese() -> None:
+        form_key = f"fin_month_wd_form_open_{year}_{month}"
+        if form_key not in st.session_state:
+            st.session_state[form_key] = False
 
-    h1, h2 = st.columns([6, 1])
-    with h1:
-        st.markdown("##### Prelievi del mese")
-    with h2:
-        if st.button(
-            "−" if st.session_state[form_key] else "+",
-            key=f"fin_month_wd_toggle_{year}_{month}",
-            help="Mostra/nascondi nuovo prelievo",
-        ):
-            st.session_state[form_key] = not st.session_state[form_key]
-            st.rerun()
+        h1, h2 = st.columns([6, 1])
+        with h1:
+            st.markdown("##### Prelievi del mese")
+        with h2:
+            if st.button(
+                "−" if st.session_state[form_key] else "+",
+                key=f"fin_month_wd_toggle_{year}_{month}",
+                help="Mostra/nascondi nuovo prelievo",
+            ):
+                st.session_state[form_key] = not st.session_state[form_key]
 
-    if withdrawals_df.empty:
-        st.info("Nessun prelievo in questo mese.")
-        selected: list[int] = []
-        df_wd = withdrawals_df
-    else:
-        df_wd = withdrawals_df
-        display_wd = pd.DataFrame(
-            {
-                "Data": df_wd["withdrawal_date"],
-                "Importo": pd.to_numeric(df_wd["amount"], errors="coerce"),
-                "Descrizione": df_wd["description"],
-            }
+        wd_df = list_withdrawals_for_month(year, month)
+        wd_sum = (
+            float(pd.to_numeric(wd_df["amount"], errors="coerce").fillna(0).sum())
+            if not wd_df.empty
+            else 0.0
         )
-        event = st.dataframe(
-            display_wd,
-            width="stretch",
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            column_config={
-                "Data": st.column_config.DateColumn("Data"),
-                "Importo": st.column_config.NumberColumn("Importo", format="€ %.2f"),
-            },
-            key=f"fin_month_wd_table_{year}_{month}",
-        )
-        selected = event.selection.rows if event and event.selection else []
-        st.caption(f"Totale prelievi: **{_fmt_euro(wd_total)}**")
 
-    withdrawal: Optional[dict[str, Any]] = None
-    withdrawal_id: Optional[int] = None
-    if selected and not df_wd.empty:
-        withdrawal_id = int(df_wd.iloc[selected[0]]["id"])
-        withdrawal = get_withdrawal(withdrawal_id)
-
-    show_form = st.session_state[form_key] or withdrawal is not None
-    if show_form:
-        st.markdown("---")
-        if withdrawal is not None:
-            st.markdown("##### Modifica prelievo")
+        if wd_df.empty:
+            st.info("Nessun prelievo in questo mese.")
+            selected: list[int] = []
         else:
-            st.markdown("##### Nuovo prelievo per questo mese")
+            display_wd = pd.DataFrame(
+                {
+                    "Data": wd_df["withdrawal_date"],
+                    "Importo": pd.to_numeric(wd_df["amount"], errors="coerce"),
+                    "Descrizione": wd_df["description"],
+                }
+            )
+            event = st.dataframe(
+                display_wd,
+                width="stretch",
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config={
+                    "Data": st.column_config.DateColumn("Data"),
+                    "Importo": st.column_config.NumberColumn(
+                        "Importo", format="€ %.2f"
+                    ),
+                },
+                key=f"fin_month_wd_table_{year}_{month}",
+            )
+            selected = event.selection.rows if event and event.selection else []
+            st.caption(f"Totale prelievi: **{_fmt_euro(wd_sum)}**")
+
+        withdrawal: Optional[dict[str, Any]] = None
+        withdrawal_id: Optional[int] = None
+        if selected and not wd_df.empty:
+            withdrawal_id = int(wd_df.iloc[selected[0]]["id"])
+            withdrawal = get_withdrawal(withdrawal_id)
+
+        show_form = st.session_state[form_key] or withdrawal is not None
+        if not show_form:
+            return
+
+        st.markdown("---")
+        title = (
+            "##### Modifica prelievo"
+            if withdrawal is not None
+            else "##### Nuovo prelievo per questo mese"
+        )
+        st.markdown(title)
 
         defaults = withdrawal or {
             "withdrawal_date": date(year, month, 1),
@@ -1785,35 +1789,27 @@ def page_contabilita_mensile() -> None:
             "amount": 0.0,
             "description": "",
         }
-
-        d1, d2 = st.columns(2)
-        with d1:
-            withdrawal_date = st.date_input(
-                "Data prelievo",
-                value=defaults.get("withdrawal_date") or date(year, month, 1),
-                key=f"mwd_date_{year}_{month}_{withdrawal_id or 'new'}",
+        form_id = f"mwd_form_{year}_{month}_{withdrawal_id or 'new'}"
+        with st.form(form_id, clear_on_submit=False):
+            d1, d2 = st.columns(2)
+            with d1:
+                withdrawal_date = st.date_input(
+                    "Data prelievo",
+                    value=defaults.get("withdrawal_date") or date(year, month, 1),
+                )
+            with d2:
+                amount = st.number_input(
+                    "Importo (€)",
+                    value=_money(defaults.get("amount")),
+                    step=0.01,
+                    format="%.2f",
+                )
+            description = st.text_input(
+                "Descrizione",
+                value=defaults.get("description") or "",
             )
-        with d2:
-            amount = st.number_input(
-                "Importo (€)",
-                value=_money(defaults.get("amount")),
-                step=0.01,
-                format="%.2f",
-                key=f"mwd_amt_{year}_{month}_{withdrawal_id or 'new'}",
-            )
-        description = st.text_input(
-            "Descrizione",
-            value=defaults.get("description") or "",
-            key=f"mwd_desc_{year}_{month}_{withdrawal_id or 'new'}",
-        )
-
-        b1, b2, _ = st.columns([1, 1, 2])
-        with b1:
-            if st.button(
-                "Salva prelievo",
-                type="primary",
-                key=f"mwd_save_{year}_{month}_{withdrawal_id or 'new'}",
-            ):
+            saved = st.form_submit_button("Salva prelievo", type="primary")
+            if saved:
                 upsert_withdrawal(
                     {
                         "withdrawal_date": withdrawal_date,
@@ -1828,21 +1824,23 @@ def page_contabilita_mensile() -> None:
                 st.session_state[form_key] = False
                 st.success("Prelievo salvato.")
                 st.rerun()
-        with b2:
-            if withdrawal_id is not None:
-                confirm = st.checkbox(
-                    "Conferma eliminazione",
-                    key=f"mwd_del_confirm_{year}_{month}_{withdrawal_id}",
-                )
-                if st.button(
-                    "Elimina",
-                    disabled=not confirm,
-                    key=f"mwd_del_{year}_{month}_{withdrawal_id}",
-                ):
-                    delete_withdrawal(withdrawal_id)
-                    total_ancora_prelevabile.clear()
-                    st.success("Prelievo eliminato.")
-                    st.rerun()
+
+        if withdrawal_id is not None:
+            confirm = st.checkbox(
+                "Conferma eliminazione",
+                key=f"mwd_del_confirm_{year}_{month}_{withdrawal_id}",
+            )
+            if st.button(
+                "Elimina",
+                disabled=not confirm,
+                key=f"mwd_del_{year}_{month}_{withdrawal_id}",
+            ):
+                delete_withdrawal(withdrawal_id)
+                total_ancora_prelevabile.clear()
+                st.success("Prelievo eliminato.")
+                st.rerun()
+
+    _prelievi_mese()
 
     st.markdown("---")
     st.markdown("##### Riepilogo netto mese")
