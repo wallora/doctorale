@@ -20,8 +20,9 @@ from finance_calc import (
     attribution_sort_date,
     attribution_year,
     attribution_year_month,
-    certain_reserve,
-    variable_reserve,
+    fixed_inps_month,
+    inps_minimale_annuo,
+    invoice_reserve,
 )
 
 INVOICE_KIND_LABELS = {
@@ -1363,13 +1364,14 @@ def _colored_metric(label: str, value: float) -> None:
     )
 
 
-def _invoice_variable_reserves(
+
+def _invoice_reserves(
     all_inv: pd.DataFrame,
     quotas_map: dict[int, Quotas],
+    fatturato_anni: dict[int, float],
 ) -> dict[int, Any]:
     """
-    Per ogni fattura: riserva variabile in base al YTD dell'anno di attribuzione.
-    Restituisce dict invoice_id → VariableReserve (o None se quote mancanti).
+    Per ogni fattura incassata: acconto (var) + saldo (extra) in base allo YTD.
     """
     if all_inv.empty:
         return {}
@@ -1398,15 +1400,16 @@ def _invoice_variable_reserves(
         if quotas is None:
             out[row["id"]] = None
         else:
-            out[row["id"]] = variable_reserve(lordo, before, quotas)
+            f_prev = float(fatturato_anni.get(int(attr) - 1, 0.0))
+            out[row["id"]] = invoice_reserve(lordo, before, f_prev, quotas)
         ytd[int(attr)] = before + lordo
     return out
 
 
 def compute_month_figures(year: int, month: int) -> dict[str, Any]:
     """
-    Calcoli sul mese di incasso: riserve variabili + enasarco sulle fatture;
-    riserva certa e prelievi a livello mese.
+    Mese di incasso: per fattura enasarco + var (acconto) + extra (saldo);
+    a livello mese solo INPS fissa (minimale / 12) e prelievi.
     """
     invoices = list_invoices_for_collection(year, month)
     enasarco_df = list_enasarco_lines_for_collection(year, month)
@@ -1414,7 +1417,7 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
     quotas_map = _load_quotas_map()
     fatturato_anni = fatturato_by_attribution_year()
     all_inv = list_invoices_lordo_all()
-    var_by_id = _invoice_variable_reserves(all_inv, quotas_map)
+    res_by_id = _invoice_reserves(all_inv, quotas_map, fatturato_anni)
 
     enasarco_by_inv: dict[int, float] = {}
     if not enasarco_df.empty:
@@ -1422,25 +1425,22 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
             iid = int(er.invoice_id)
             enasarco_by_inv[iid] = enasarco_by_inv.get(iid, 0.0) + float(er.amount)
 
-    # Riserva certa: F(Y-1) con quote Y-1; minimale INPS con quote Y
-    source_quotas = quotas_map.get(year - 1) or quotas_map.get(year)
-    current_quotas = quotas_map.get(year) or source_quotas
-    certa = None
-    if source_quotas is not None:
-        certa = certain_reserve(
-            year, fatturato_anni, source_quotas, current_quotas
-        )
+    current_quotas = quotas_map.get(year)
+    inps_fissa = fixed_inps_month(current_quotas) if current_quotas else 0.0
+    inps_min_annuo = (
+        inps_minimale_annuo(current_quotas) if current_quotas else 0.0
+    )
 
     total_lordo = 0.0
     total_enasarco_tassa = 0.0
-    var_inps = 0.0
-    var_ir = 0.0
-    netto_fatture = 0.0
+    sum_inps_var = 0.0
+    sum_ir_var = 0.0
+    sum_inps_extra = 0.0
+    sum_ir_extra = 0.0
+    sum_totale_fatture = 0.0
     missing_quotas: set[int] = set()
     attr_years_used: set[int] = set()
-    quotas_by_year: dict[int, Quotas] = {}
     inv_rows: list[dict[str, Any]] = []
-    var_details: list[dict[str, Any]] = []
 
     for r in invoices.itertuples(index=False):
         issue = r.issue_date
@@ -1448,47 +1448,34 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
         attr = attribution_year(issue, pay)
         lordo = float(r.lordo_senza_enasarco)
         ena_line = float(enasarco_by_inv.get(int(r.id), 0.0))
-        ena_tassa = -ena_line  # voce di solito negativa → costo positivo
+        ena_tassa = -ena_line
         total_lordo += lordo
         total_enasarco_tassa += ena_tassa
-        vr = var_by_id.get(int(r.id))
-        v_inps = v_ir = 0.0
-        note = ""
+        res = res_by_id.get(int(r.id))
+        inps_var = ir_var = inps_extra = ir_extra = 0.0
+        ytd_before = soglia = 0.0
+        f_prev = 0.0
         if attr is not None:
             attr_years_used.add(int(attr))
-        if attr is not None and attr in quotas_map:
-            quotas_by_year[int(attr)] = quotas_map[int(attr)]
-        if vr is None:
+        if res is None:
             if attr is not None and attr not in quotas_map:
                 missing_quotas.add(int(attr))
-            note = (
-                f"Quote mancanti per {attr}"
-                if attr
-                else "Senza data di pagamento"
-            )
         else:
-            v_inps = vr.inps
-            v_ir = vr.ir
-            var_inps += v_inps
-            var_ir += v_ir
-            note = (
-                f"YTD prima {_fmt_euro(vr.f_ytd_before)} · "
-                f"soglia {_fmt_euro(vr.threshold_fatturato)}"
-            )
-            var_details.append(
-                {
-                    "Fattura": f"{int(r.series_year)}-{int(r.number):02d}",
-                    "Lordo": lordo,
-                    "Sotto soglia": vr.amount_below,
-                    "Sopra soglia": vr.amount_above,
-                    "INPS var": v_inps,
-                    "IR var": v_ir,
-                    "% eff.": vr.pct_effective,
-                }
-            )
+            inps_var = res.inps_var
+            ir_var = res.ir_var
+            inps_extra = res.inps_extra
+            ir_extra = res.ir_extra
+            ytd_before = res.f_ytd_before
+            soglia = res.threshold_fatturato
+            f_prev = res.fatturato_prev_year
+            sum_inps_var += inps_var
+            sum_ir_var += ir_var
+            sum_inps_extra += inps_extra
+            sum_ir_extra += ir_extra
 
-        netto_inv = lordo - ena_tassa - v_inps - v_ir
-        netto_fatture += netto_inv
+        totale_inv = inps_var + ir_var + inps_extra + ir_extra
+        sum_totale_fatture += totale_inv
+        netto_inv = lordo - ena_tassa - totale_inv
         competenza = (
             f"{_month_label(int(r.reference_month))} {int(r.reference_year)}"
             if r.reference_year is not None and r.reference_month is not None
@@ -1501,12 +1488,17 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
                 "Competenza": competenza,
                 "Emissione": issue,
                 "Pagamento": pay,
+                "YTD prima": ytd_before,
+                "Soglia": soglia,
+                "F(Y−1)": f_prev,
                 "Lordo": lordo,
                 "Enasarco": ena_tassa,
-                "INPS var": v_inps,
-                "IR var": v_ir,
+                "INPS var": inps_var,
+                "IR var": ir_var,
+                "INPS extra": inps_extra,
+                "IR extra": ir_extra,
+                "Da accantonare": totale_inv,
                 "Netto": netto_inv,
-                "Note": note,
             }
         )
 
@@ -1515,54 +1507,48 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
         if not withdrawals_df.empty
         else 0.0
     )
-    certa_inps = float(certa.inps_month) if certa else 0.0
-    certa_ir = float(certa.ir_month) if certa else 0.0
-    certa_totale = certa_inps + certa_ir
-    # Netto mese = somma netti fattura − riserva certa
-    netto = netto_fatture - certa_totale
+    totale_mese = sum_totale_fatture + inps_fissa
+    netto = total_lordo - total_enasarco_tassa - totale_mese
     netto_residuo = netto - wd_total
-    tasse = total_enasarco_tassa + certa_totale + var_inps + var_ir
 
     return {
         "invoices": invoices,
         "inv_rows": inv_rows,
-        "var_details": var_details,
         "enasarco_df": enasarco_df,
         "withdrawals_df": withdrawals_df,
         "lordo": total_lordo,
-        "enasarco": -total_enasarco_tassa,  # somma voci (di solito negativa)
+        "enasarco": -total_enasarco_tassa,
         "enasarco_tassa": total_enasarco_tassa,
-        "certa": certa,
-        "certa_inps": certa_inps,
-        "certa_ir": certa_ir,
-        "certa_totale": certa_totale,
-        "var_inps": var_inps,
-        "var_ir": var_ir,
-        "netto_fatture": netto_fatture,
-        "tasse": tasse,
+        "inps_fissa": inps_fissa,
+        "inps_min_annuo": inps_min_annuo,
+        "current_quotas": current_quotas,
+        "inps_var": sum_inps_var,
+        "ir_var": sum_ir_var,
+        "inps_extra": sum_inps_extra,
+        "ir_extra": sum_ir_extra,
+        "totale_fatture": sum_totale_fatture,
+        "totale_mese": totale_mese,
         "netto": netto,
         "prelievi": wd_total,
         "netto_residuo": netto_residuo,
         "missing_quotas": missing_quotas,
         "attr_years_used": attr_years_used,
-        "quotas_by_year": quotas_by_year,
         "fatturato_anni": fatturato_anni,
     }
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def total_ancora_prelevabile() -> float:
-    """Somma netti residui per mese di incasso: certa/12 + var + enasarco − prelievi."""
+    """Somma netti residui per mese di incasso."""
     quotas_map = _load_quotas_map()
     fatturato_anni = fatturato_by_attribution_year()
     all_inv = list_invoices_lordo_all()
-    var_by_id = _invoice_variable_reserves(all_inv, quotas_map)
+    res_by_id = _invoice_reserves(all_inv, quotas_map, fatturato_anni)
     month_ena = enasarco_by_collection_month()
     month_wd = withdrawals_by_month()
 
     month_lordo: dict[tuple[int, int], float] = {}
-    month_var_inps: dict[tuple[int, int], float] = {}
-    month_var_ir: dict[tuple[int, int], float] = {}
+    month_acc: dict[tuple[int, int], float] = {}
     years: set[int] = set()
 
     if not all_inv.empty:
@@ -1573,45 +1559,29 @@ def total_ancora_prelevabile() -> float:
             years.add(key[0])
             lordo = float(r.lordo)
             month_lordo[key] = month_lordo.get(key, 0.0) + lordo
-            vr = var_by_id.get(int(r.id))
-            if vr is not None:
-                month_var_inps[key] = month_var_inps.get(key, 0.0) + vr.inps
-                month_var_ir[key] = month_var_ir.get(key, 0.0) + vr.ir
+            res = res_by_id.get(int(r.id))
+            if res is not None:
+                month_acc[key] = month_acc.get(key, 0.0) + res.totale
 
     for y, _m in month_ena:
         years.add(y)
     for y, _m in month_wd:
         years.add(y)
 
-    certa_by_year: dict[int, tuple[float, float]] = {}
+    fissa_by_year: dict[int, float] = {}
     for y in years:
-        q_src = quotas_map.get(y - 1) or quotas_map.get(y)
-        q_cur = quotas_map.get(y) or q_src
-        if q_src is None:
-            certa_by_year[y] = (0.0, 0.0)
-            continue
-        cr = certain_reserve(y, fatturato_anni, q_src, q_cur)
-        certa_by_year[y] = (cr.inps_month, cr.ir_month)
+        q = quotas_map.get(y)
+        fissa_by_year[y] = fixed_inps_month(q) if q else 0.0
 
-    keys = set(month_lordo) | set(month_ena) | set(month_wd)
+    keys = set(month_lordo) | set(month_ena) | set(month_wd) | set(month_acc)
     total = 0.0
     for key in keys:
         y, _m = key
         lordo = month_lordo.get(key, 0.0)
         enasarco_tassa = -month_ena.get(key, 0.0)
-        c_inps, c_ir = certa_by_year.get(y, (0.0, 0.0))
-        v_inps = month_var_inps.get(key, 0.0)
-        v_ir = month_var_ir.get(key, 0.0)
+        acc = month_acc.get(key, 0.0) + fissa_by_year.get(y, 0.0)
         prelievi = month_wd.get(key, 0.0)
-        total += (
-            lordo
-            - enasarco_tassa
-            - c_inps
-            - c_ir
-            - v_inps
-            - v_ir
-            - prelievi
-        )
+        total += lordo - enasarco_tassa - acc - prelievi
     return total
 
 
@@ -1619,8 +1589,8 @@ def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
         "Mese = data di pagamento (solo fatture incassate). "
-        "Su ogni fattura: enasarco + riserva variabile. "
-        f"A livello mese: riserva certa ÷ {CERTAIN_RESERVE_MONTHS} e prelievi."
+        "Per fattura: enasarco + IR/INPS var (acconto) + IR/INPS extra (saldo). "
+        f"Per mese: INPS fissa (minimale ÷ {CERTAIN_RESERVE_MONTHS})."
     )
 
     periods = list_collection_periods()
@@ -1643,59 +1613,52 @@ def page_contabilita_mensile() -> None:
     fatturato_anni = fig["fatturato_anni"]
     attr_years_used: set[int] = fig["attr_years_used"]
     missing_quotas: set[int] = fig["missing_quotas"]
-    certa = fig["certa"]
-    certa_inps = float(fig["certa_inps"])
-    certa_ir = float(fig["certa_ir"])
-    certa_totale = float(fig["certa_totale"])
-    netto_fatture = float(fig["netto_fatture"])
+    inps_fissa = float(fig["inps_fissa"])
+    inps_min_annuo = float(fig["inps_min_annuo"])
+    totale_fatture = float(fig["totale_fatture"])
+    totale_mese = float(fig["totale_mese"])
     wd_total = float(fig["prelievi"])
+    current_quotas = fig["current_quotas"]
 
-    # --- Fatture: riserve variabili + netto per documento ---
     st.markdown("##### Fatture incassate nel mese")
     if not fig["inv_rows"]:
         st.info("Nessuna fattura incassata in questo mese.")
     else:
+        money_cols = [
+            "YTD prima",
+            "Soglia",
+            "F(Y−1)",
+            "Lordo",
+            "Enasarco",
+            "INPS var",
+            "IR var",
+            "INPS extra",
+            "IR extra",
+            "Da accantonare",
+            "Netto",
+        ]
+        col_config = {
+            "Emissione": st.column_config.DateColumn("Emissione"),
+            "Pagamento": st.column_config.DateColumn("Pagamento"),
+        }
+        for c in money_cols:
+            col_config[c] = st.column_config.NumberColumn(c, format="€ %.2f")
         st.dataframe(
             pd.DataFrame(fig["inv_rows"]),
             width="stretch",
             hide_index=True,
-            column_config={
-                "Emissione": st.column_config.DateColumn("Emissione"),
-                "Pagamento": st.column_config.DateColumn("Pagamento"),
-                "Lordo": st.column_config.NumberColumn("Lordo", format="€ %.2f"),
-                "Enasarco": st.column_config.NumberColumn("Enasarco", format="€ %.2f"),
-                "INPS var": st.column_config.NumberColumn("INPS var", format="€ %.2f"),
-                "IR var": st.column_config.NumberColumn("IR var", format="€ %.2f"),
-                "Netto": st.column_config.NumberColumn("Netto", format="€ %.2f"),
-            },
+            column_config=col_config,
             key=f"fin_month_inv_{year}_{month}",
         )
         st.caption(
-            f"Somma netti fattura: **{_fmt_euro(netto_fatture)}** "
-            f"(lordo − enasarco − INPS var − IR var)"
+            f"Somma da accantonare sulle fatture: **{_fmt_euro(totale_fatture)}** "
+            f"(INPS/IR var + INPS/IR extra)"
         )
     if missing_quotas:
         st.warning(
             "Mancano le quote annuali per: "
             + ", ".join(str(y) for y in sorted(missing_quotas))
         )
-
-    if fig["var_details"]:
-        with st.expander("Dettaglio soglia / riserva variabile", expanded=False):
-            st.dataframe(
-                pd.DataFrame(fig["var_details"]),
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Lordo": st.column_config.NumberColumn(format="€ %.2f"),
-                    "Sotto soglia": st.column_config.NumberColumn(format="€ %.2f"),
-                    "Sopra soglia": st.column_config.NumberColumn(format="€ %.2f"),
-                    "INPS var": st.column_config.NumberColumn(format="€ %.2f"),
-                    "IR var": st.column_config.NumberColumn(format="€ %.2f"),
-                    "% eff.": st.column_config.NumberColumn(format="%.4f"),
-                },
-                key=f"fin_month_var_{year}_{month}",
-            )
 
     if not enasarco_df.empty:
         with st.expander("Dettaglio voci enasarco", expanded=False):
@@ -1723,42 +1686,25 @@ def page_contabilita_mensile() -> None:
                 key=f"fin_month_enasarco_{year}_{month}",
             )
 
-    # --- Accantonamento fisso del mese (non sulle fatture) ---
-    st.markdown("##### Accantonamento mese (riserva certa)")
-    if certa is not None:
-        floor_note = (
-            f"minimale {_fmt_euro(certa.inps_minimale)}"
-            if certa.used_minimale
-            else f"da F({certa.source_year}) {_fmt_euro(certa.inps_from_prev)}"
-        )
-        det_certa_inps = (
-            f"max(F({certa.source_year}) {_fmt_euro(certa.inps_from_prev)}, "
-            f"minimale {_fmt_euro(certa.inps_minimale)}) "
-            f"= {_fmt_euro(certa.inps_annual)} ÷ {CERTAIN_RESERVE_MONTHS} "
-            f"= {_fmt_euro(certa_inps)} (usato: {floor_note})"
-        )
-        det_certa_ir = (
-            f"Obbligo IR da F({certa.source_year}): "
-            f"{_fmt_euro(certa.ir_annual)} ÷ {CERTAIN_RESERVE_MONTHS} "
-            f"= {_fmt_euro(certa_ir)}"
-        )
+    st.markdown("##### Accantonamento fisso del mese")
+    if current_quotas is None:
+        det_fissa = f"Quote anno {year} mancanti"
     else:
-        det_certa_inps = f"Quote anno {year - 1} (o {year}) mancanti"
-        det_certa_ir = det_certa_inps
-
+        det_fissa = (
+            f"Minimale {_fmt_euro(current_quotas.inps_min_base or 0)} × "
+            f"INPS {_fmt_pct(current_quotas.inps_rate)} × "
+            f"(1 − sconto {_fmt_pct(current_quotas.inps_discount_rate)}) "
+            f"= {_fmt_euro(inps_min_annuo)} ÷ {CERTAIN_RESERVE_MONTHS} "
+            f"= {_fmt_euro(inps_fissa)}"
+        )
     st.dataframe(
         pd.DataFrame(
             [
                 {
-                    "Voce": "Riserva certa INPS",
-                    "Importo": certa_inps,
-                    "Dettaglio": det_certa_inps,
-                },
-                {
-                    "Voce": "Riserva certa IR",
-                    "Importo": certa_ir,
-                    "Dettaglio": det_certa_ir,
-                },
+                    "Voce": "INPS fissa (minimale / 12)",
+                    "Importo": inps_fissa,
+                    "Dettaglio": det_fissa,
+                }
             ]
         ),
         width="stretch",
@@ -1767,21 +1713,19 @@ def page_contabilita_mensile() -> None:
             "Importo": st.column_config.NumberColumn("Importo", format="€ %.2f"),
             "Dettaglio": st.column_config.TextColumn("Dettaglio", width="large"),
         },
-        key=f"fin_month_certa_{year}_{month}",
+        key=f"fin_month_fissa_{year}_{month}",
     )
     st.caption(
-        f"Totale riserva certa: **{_fmt_euro(certa_totale)}** "
-        "(fisso di calendario, indipendente dagli incassi del mese)"
+        "Indipendente dal fatturato: dovuta ogni mese anche senza incassi."
     )
 
     years_ctx = set(attr_years_used)
     years_ctx.add(year)
     years_ctx.add(year - 1)
-    with st.expander("Contesto tasse annuali (saldo su surplus + acconto)", expanded=False):
+    with st.expander("Contesto tasse annuali (saldo + acconto)", expanded=False):
         st.caption(
-            "Fatturato = voci senza enasarco, solo fatture con data di pagamento. "
-            "La riserva certa del mese usa "
-            f"gli obblighi calcolati sul fatturato {year - 1}."
+            "Fatturato = solo fatture pagate. "
+            "Saldo = surplus vs anno precedente; acconto = % sul fatturato anno."
         )
         for ay in sorted(y for y in years_ctx if y > 0):
             quotas = _quotas_or_none(ay)
@@ -1803,7 +1747,6 @@ def page_contabilita_mensile() -> None:
                 f"{_fmt_euro(ann.ir_acconto)} = **{_fmt_euro(ann.ir_totale)}**"
             )
 
-    # --- Prelievi ---
     st.markdown("##### Prelievi del mese")
     if withdrawals_df.empty:
         st.info("Nessun prelievo in questo mese.")
@@ -1908,16 +1851,17 @@ def page_contabilita_mensile() -> None:
                 st.success("Prelievo eliminato.")
                 st.rerun()
 
-    # --- Riepilogo netto ---
     st.markdown("---")
     st.markdown("##### Riepilogo netto mese")
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("Somma netti fattura", _fmt_euro(netto_fatture))
-    r2.metric("Riserva certa", _fmt_euro(certa_totale))
-    r3.metric("Prelievi", _fmt_euro(wd_total))
-    with r4:
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Lordo", _fmt_euro(fig["lordo"]))
+    r2.metric("Enasarco", _fmt_euro(fig["enasarco_tassa"]))
+    r3.metric("Da accantonare", _fmt_euro(totale_mese))
+    r4.metric("Prelievi", _fmt_euro(wd_total))
+    with r5:
         _colored_metric("Netto residuo", float(fig["netto_residuo"]))
     st.caption(
-        "Netto fattura = lordo − enasarco − INPS/IR variabili · "
-        "Netto residuo = somma netti fattura − riserva certa − prelievi."
+        f"Da accantonare = somma fatture {_fmt_euro(totale_fatture)} "
+        f"+ INPS fissa {_fmt_euro(inps_fissa)}. "
+        "Netto = lordo − enasarco − da accantonare − prelievi."
     )

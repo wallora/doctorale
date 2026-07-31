@@ -1,6 +1,7 @@
 """
-Calcoli contabili: riserva certa (da anno precedente / 12),
-riserva variabile (soglia minimale INPS), saldo/acconto annuali.
+Calcoli contabili:
+- fissa mese = minimale INPS / 12
+- per fattura: acconto (var × % acconto) + saldo (extra sopra F(Y−1))
 """
 
 from __future__ import annotations
@@ -52,7 +53,6 @@ class GrossBreakdown:
     imponibile_reddito: float
     imposta_reddito: float
 
-    # Alias per compatibilità con codice che usava imponibile_inps
     @property
     def imponibile_inps(self) -> float:
         return self.imponibile
@@ -73,38 +73,26 @@ class AnnualTax:
 
 
 @dataclass(frozen=True)
-class CertainReserve:
+class InvoiceReserve:
     """
-    Riserva certa mensile = obblighi annuali / 12.
+    Accantonamento su una fattura incassata.
 
-    INPS: max(obbligo da F(Y−1), minimale INPS anno corrente)
-    IR: solo obbligo da F(Y−1)
+    - var (INPS/IR) = componente acconto (× % acconto)
+    - extra (INPS/IR) = componente saldo sul surplus vs F(Y−1)
     """
-
-    reference_year: int  # anno in cui si accantona (anno corrente)
-    source_year: int  # anno fatturato che determina l'obbligo (Y-1)
-    inps_from_prev: float  # saldo+acconto INPS su F(Y-1)
-    inps_minimale: float  # inps_min_base × rate × (1−sconto), quote anno corrente
-    inps_annual: float  # max(from_prev, minimale) — base usata per /12
-    ir_annual: float
-    inps_month: float
-    ir_month: float
-    annual: AnnualTax
-    used_minimale: bool
-
-
-@dataclass(frozen=True)
-class VariableReserve:
-    """Accantonamento variabile su un importo di fatturato, con split soglia."""
 
     amount: float
     f_ytd_before: float
+    fatturato_prev_year: float
     threshold_fatturato: float
-    amount_below: float
-    amount_above: float
-    inps: float
-    ir: float
-    pct_effective: float
+    amount_below_threshold: float
+    amount_above_threshold: float
+    amount_surplus: float
+    inps_var: float
+    ir_var: float
+    inps_extra: float
+    ir_extra: float
+    totale: float  # var + extra (senza enasarco)
 
 
 def attribution_year(
@@ -170,6 +158,28 @@ def breakdown_from_lordo(lordo: float, quotas: Quotas) -> GrossBreakdown:
     )
 
 
+def tax_inps_on_lordo(lordo: float, quotas: Quotas) -> float:
+    """INPS pieno su un pezzo di fatturato."""
+    lordo = float(lordo)
+    if lordo <= 0:
+        return 0.0
+    return (
+        lordo
+        * quotas.imponibile_rate
+        * quotas.inps_rate
+        * (1.0 - quotas.inps_discount_rate)
+    )
+
+
+def tax_ir_on_lordo(lordo: float, inps: float, quotas: Quotas) -> float:
+    """IR su un pezzo di fatturato, dopo deduzione INPS."""
+    lordo = float(lordo)
+    if lordo <= 0:
+        return 0.0
+    imponibile = lordo * quotas.imponibile_rate
+    return max(0.0, imponibile - float(inps)) * quotas.income_tax_rate
+
+
 def annual_taxes(
     year: int,
     fatturato: float,
@@ -222,83 +232,58 @@ def inps_minimale_annuo(quotas: Quotas) -> float:
     )
 
 
-def certain_reserve(
-    current_year: int,
-    fatturato_by_year: Mapping[int, float],
-    quotas_for_source_year: Quotas,
-    quotas_for_current_year: Optional[Quotas] = None,
-) -> CertainReserve:
-    """
-    Riserva certa per l'anno corrente, divisa per 12.
-
-    - INPS: max(obbligo da F(Y−1), minimale INPS con quote dell'anno corrente)
-    - IR: solo obbligo da F(Y−1) (saldo surplus + acconto)
-    """
-    quotas_cur = quotas_for_current_year or quotas_for_source_year
-    source_year = current_year - 1
-    f_src = float(fatturato_by_year.get(source_year, 0.0))
-    f_prev = float(fatturato_by_year.get(source_year - 1, 0.0))
-    ann = annual_taxes(source_year, f_src, f_prev, quotas_for_source_year)
-    inps_from_prev = float(ann.inps_totale)
-    inps_min = inps_minimale_annuo(quotas_cur)
-    inps_annual = max(inps_from_prev, inps_min)
-    ir_annual = float(ann.ir_totale)
-    n = float(CERTAIN_RESERVE_MONTHS)
-    return CertainReserve(
-        reference_year=current_year,
-        source_year=source_year,
-        inps_from_prev=inps_from_prev,
-        inps_minimale=inps_min,
-        inps_annual=inps_annual,
-        ir_annual=ir_annual,
-        inps_month=inps_annual / n,
-        ir_month=ir_annual / n,
-        annual=ann,
-        used_minimale=inps_annual > inps_from_prev + 1e-9,
-    )
+def fixed_inps_month(quotas: Quotas) -> float:
+    """Quota fissa INPS mensile = minimale annuale / 12."""
+    return inps_minimale_annuo(quotas) / float(CERTAIN_RESERVE_MONTHS)
 
 
-def _variable_on_slice(amount: float, above_threshold: bool, quotas: Quotas) -> tuple[float, float]:
-    """Restituisce (inps, ir) su un pezzo di fatturato."""
-    amount = float(amount)
-    if amount <= 0:
-        return 0.0, 0.0
-    imponibile = amount * quotas.imponibile_rate
-    if not above_threshold:
-        # Sotto soglia: solo imposta sul reddito (INPS già coperto dal minimale)
-        return 0.0, imponibile * quotas.income_tax_rate
-    inps = imponibile * quotas.inps_rate * (1.0 - quotas.inps_discount_rate)
-    ir = (imponibile - inps) * quotas.income_tax_rate
-    return inps, ir
-
-
-def variable_reserve(
+def invoice_reserve(
     amount: float,
     f_ytd_before: float,
+    fatturato_prev_year: float,
     quotas: Quotas,
-) -> VariableReserve:
+) -> InvoiceReserve:
     """
-    Riserva variabile su un incasso, con split se attraversa la soglia
-    (reddito imponibile = fatturato × imponibile_rate vs inps_min_base).
+    Accantonamento su un incasso.
+
+    INPS/IR var (acconto):
+      - INPS solo sulla parte sopra soglia minimale, × % acconto INPS
+      - IR su tutta la fattura (imponibile − INPS pieno sopra soglia) × % acconto IR
+    INPS/IR extra (saldo):
+      - solo sulla parte che, unita allo YTD, supera F(Y−1), aliquota piena
     """
     amount = float(amount)
     f_ytd_before = float(f_ytd_before)
+    fatturato_prev_year = float(fatturato_prev_year)
     thr = fatturato_threshold(quotas)
-    below_room = max(0.0, thr - f_ytd_before)
-    amount_below = min(max(0.0, amount), below_room)
+
+    below_thr_room = max(0.0, thr - f_ytd_before)
+    amount_below = min(max(0.0, amount), below_thr_room)
     amount_above = max(0.0, amount - amount_below)
-    inps_b, ir_b = _variable_on_slice(amount_below, False, quotas)
-    inps_a, ir_a = _variable_on_slice(amount_above, True, quotas)
-    inps = inps_b + inps_a
-    ir = ir_b + ir_a
-    pct = (inps + ir) / amount if amount > 0 else 0.0
-    return VariableReserve(
+
+    below_prev_room = max(0.0, fatturato_prev_year - f_ytd_before)
+    amount_surplus = max(0.0, amount - below_prev_room)
+
+    inps_above_full = tax_inps_on_lordo(amount_above, quotas)
+    inps_var = inps_above_full * quotas.inps_advance_rate
+    ir_full = tax_ir_on_lordo(amount, inps_above_full, quotas)
+    ir_var = ir_full * quotas.income_tax_advance_rate
+
+    inps_extra = tax_inps_on_lordo(amount_surplus, quotas)
+    ir_extra = tax_ir_on_lordo(amount_surplus, inps_extra, quotas)
+
+    totale = inps_var + ir_var + inps_extra + ir_extra
+    return InvoiceReserve(
         amount=amount,
         f_ytd_before=f_ytd_before,
+        fatturato_prev_year=fatturato_prev_year,
         threshold_fatturato=thr,
-        amount_below=amount_below,
-        amount_above=amount_above,
-        inps=inps,
-        ir=ir,
-        pct_effective=pct,
+        amount_below_threshold=amount_below,
+        amount_above_threshold=amount_above,
+        amount_surplus=amount_surplus,
+        inps_var=inps_var,
+        ir_var=ir_var,
+        inps_extra=inps_extra,
+        ir_extra=ir_extra,
+        totale=totale,
     )
