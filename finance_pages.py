@@ -17,12 +17,16 @@ from sales_parser import MESI_LABEL
 from finance_calc import (
     CERTAIN_RESERVE_MONTHS,
     Quotas,
+    applies_fixed_inps,
+    as_of_month,
     attribution_sort_date,
     attribution_year,
     attribution_year_month,
     fixed_inps_month,
+    fixed_inps_months_in_year,
     inps_minimale_annuo,
     invoice_reserve,
+    iter_year_months,
 )
 
 INVOICE_KIND_LABELS = {
@@ -691,6 +695,9 @@ def _annual_finance_bundle() -> dict[str, Any]:
     years.update(year_ir_acconto)
     years.update(year_ir_saldo)
 
+    activity_start = _finance_activity_start()
+    as_of = as_of_month()
+
     monthly: dict[str, dict[int, list[float]]] = {
         key: {} for key, _ in ANNUAL_METRICS
     }
@@ -698,11 +705,16 @@ def _annual_finance_bundle() -> dict[str, Any]:
 
     for y in years:
         fissa_mese = fixed_inps_month(quotas_map[y]) if y in quotas_map else 0.0
-        fissa_anno = fissa_mese * float(CERTAIN_RESERVE_MONTHS)
+        fissa_n = fixed_inps_months_in_year(y, activity_start, as_of)
+        fissa_anno = fissa_mese * float(fissa_n)
         fat_c = _months_vector_from_map(fat_cassa, y)
         ena = _months_vector_from_map(ena_cost, y)
         acc_inv = _months_vector_from_map(month_acc_inv, y)
-        acc = [acc_inv[i] + fissa_mese for i in range(12)]
+        acc = [
+            acc_inv[i]
+            + (fissa_mese if applies_fixed_inps(y, i + 1, activity_start, as_of) else 0.0)
+            for i in range(12)
+        ]
         netto_m = [fat_c[i] - ena[i] - acc[i] for i in range(12)]
         prel_m = _months_vector_from_map(prelievi, y)
         fat_comp_m = _months_vector_from_map(fat_comp, y)
@@ -745,7 +757,8 @@ def annual_metrics_by_year() -> dict[str, dict[int, list[float]]]:
     Enasarco / Accantonamenti / Netto = cassa (payment_date).
     Fatturato disponibile in competenza e cassa.
     Netto = fatturato cassa − enasarco − accantonamenti (prima dei prelievi).
-    Accantonamenti = riserve su fatture + INPS fissa / 12 ogni mese.
+    Accantonamenti = riserve su fatture + INPS fissa nei mesi da inizio
+    attività al mese corrente (anche mesi magri; non mesi futuri).
     """
     return _annual_finance_bundle()["monthly"]
 
@@ -1643,7 +1656,13 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
             enasarco_by_inv[iid] = enasarco_by_inv.get(iid, 0.0) + float(er.amount)
 
     current_quotas = quotas_map.get(year)
-    inps_fissa = fixed_inps_month(current_quotas) if current_quotas else 0.0
+    activity_start = _finance_activity_start()
+    as_of = as_of_month()
+    inps_fissa = (
+        fixed_inps_month(current_quotas)
+        if current_quotas and applies_fixed_inps(year, month, activity_start, as_of)
+        else 0.0
+    )
     inps_min_annuo = (
         inps_minimale_annuo(current_quotas) if current_quotas else 0.0
     )
@@ -1757,11 +1776,27 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
 def _clear_finance_caches() -> None:
     total_ancora_prelevabile.clear()
     _annual_finance_bundle.clear()
+    _finance_activity_start.clear()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _finance_activity_start() -> Optional[tuple[int, int]]:
+    """Primo mese con incassi, enasarco o prelievi (inizio attività)."""
+    keys: set[tuple[int, int]] = set()
+    all_inv = list_invoices_lordo_all()
+    if not all_inv.empty:
+        for r in all_inv.itertuples(index=False):
+            key = attribution_year_month(r.issue_date, r.payment_date)
+            if key is not None:
+                keys.add(key)
+    keys.update(enasarco_by_collection_month().keys())
+    keys.update(withdrawals_by_month().keys())
+    return min(keys) if keys else None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def total_ancora_prelevabile() -> float:
-    """Somma netti residui per mese di incasso."""
+    """Somma netti residui per mese: da inizio attività al mese corrente."""
     quotas_map = _load_quotas_map()
     fatturato_anni = fatturato_by_attribution_year()
     all_inv = list_invoices_lordo_all()
@@ -1771,37 +1806,39 @@ def total_ancora_prelevabile() -> float:
 
     month_lordo: dict[tuple[int, int], float] = {}
     month_acc: dict[tuple[int, int], float] = {}
-    years: set[int] = set()
 
     if not all_inv.empty:
         for r in all_inv.itertuples(index=False):
             key = attribution_year_month(r.issue_date, r.payment_date)
             if key is None:
                 continue
-            years.add(key[0])
             lordo = float(r.lordo)
             month_lordo[key] = month_lordo.get(key, 0.0) + lordo
             res = res_by_id.get(int(r.id))
             if res is not None:
                 month_acc[key] = month_acc.get(key, 0.0) + res.totale
 
-    for y, _m in month_ena:
-        years.add(y)
-    for y, _m in month_wd:
-        years.add(y)
+    activity_keys = set(month_lordo) | set(month_ena) | set(month_wd) | set(month_acc)
+    activity_start = min(activity_keys) if activity_keys else None
+    if activity_start is None:
+        return 0.0
+    as_of = as_of_month()
 
     fissa_by_year: dict[int, float] = {}
-    for y in years:
-        q = quotas_map.get(y)
-        fissa_by_year[y] = fixed_inps_month(q) if q else 0.0
-
-    keys = set(month_lordo) | set(month_ena) | set(month_wd) | set(month_acc)
     total = 0.0
-    for key in keys:
-        y, _m = key
+    for key in iter_year_months(activity_start, as_of):
+        y, m = key
+        if y not in fissa_by_year:
+            q = quotas_map.get(y)
+            fissa_by_year[y] = fixed_inps_month(q) if q else 0.0
         lordo = month_lordo.get(key, 0.0)
         enasarco_tassa = -month_ena.get(key, 0.0)
-        acc = month_acc.get(key, 0.0) + fissa_by_year.get(y, 0.0)
+        fissa = (
+            fissa_by_year[y]
+            if applies_fixed_inps(y, m, activity_start, as_of)
+            else 0.0
+        )
+        acc = month_acc.get(key, 0.0) + fissa
         prelievi = month_wd.get(key, 0.0)
         total += lordo - enasarco_tassa - acc - prelievi
     return total
@@ -1812,7 +1849,8 @@ def page_contabilita_mensile() -> None:
     st.caption(
         "Mese = data di pagamento (solo fatture incassate). "
         "Per fattura: enasarco + INPS/IR acconto + INPS/IR saldo. "
-        f"Per mese: INPS fissa (minimale ÷ {CERTAIN_RESERVE_MONTHS})."
+        f"Per mese: INPS fissa (minimale ÷ {CERTAIN_RESERVE_MONTHS}) "
+        "dal primo mese di attività al mese corrente (anche mesi magri)."
     )
 
     periods = list_collection_periods()
@@ -1887,13 +1925,20 @@ def page_contabilita_mensile() -> None:
     if current_quotas is None:
         det_fissa = f"Quote anno {year} mancanti"
     else:
-        det_fissa = (
-            f"Minimale {_fmt_euro(current_quotas.inps_min_base or 0)} × "
-            f"INPS {_fmt_pct(current_quotas.inps_rate)} × "
-            f"(1 − sconto {_fmt_pct(current_quotas.inps_discount_rate)}) "
-            f"= {_fmt_euro(inps_min_annuo)} ÷ {CERTAIN_RESERVE_MONTHS} "
-            f"= {_fmt_euro(inps_fissa)}"
-        )
+        fissa_piena = fixed_inps_month(current_quotas)
+        if inps_fissa > 0:
+            det_fissa = (
+                f"Minimale {_fmt_euro(current_quotas.inps_min_base or 0)} × "
+                f"INPS {_fmt_pct(current_quotas.inps_rate)} × "
+                f"(1 − sconto {_fmt_pct(current_quotas.inps_discount_rate)}) "
+                f"= {_fmt_euro(inps_min_annuo)} ÷ {CERTAIN_RESERVE_MONTHS} "
+                f"= {_fmt_euro(inps_fissa)}"
+            )
+        else:
+            det_fissa = (
+                f"Non applicata (fuori dalla finestra inizio attività → mese corrente). "
+                f"Quota piena sarebbe {_fmt_euro(fissa_piena)}."
+            )
     st.dataframe(
         pd.DataFrame(
             [
@@ -2154,7 +2199,8 @@ def page_contabilita_annuale() -> None:
     st.caption(
         "Totali annuali. Enasarco e riserve in cassa. "
         "Netto = fatturato cassa − enasarco − INPS/IR acconto e saldo − INPS fissa "
-        "(minimale annuale), prima dei prelievi."
+        "(dal primo mese di attività al mese corrente, anche mesi magri), "
+        "prima dei prelievi."
     )
     totals = annual_totals_by_year()
     detail_rows = []

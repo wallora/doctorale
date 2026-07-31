@@ -237,6 +237,58 @@ def fixed_inps_month(quotas: Quotas) -> float:
     return inps_minimale_annuo(quotas) / float(CERTAIN_RESERVE_MONTHS)
 
 
+def as_of_month(today: Optional[date] = None) -> tuple[int, int]:
+    """Mese corrente (anno, mese), limite superiore per la fissa."""
+    d = today if today is not None else date.today()
+    return int(d.year), int(d.month)
+
+
+def iter_year_months(
+    start: tuple[int, int],
+    end: tuple[int, int],
+):
+    """Genera (anno, mese) da start a end inclusi."""
+    y, m = int(start[0]), int(start[1])
+    y_end, m_end = int(end[0]), int(end[1])
+    while (y, m) <= (y_end, m_end):
+        yield y, m
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+
+
+def applies_fixed_inps(
+    year: int,
+    month: int,
+    activity_start: Optional[tuple[int, int]],
+    as_of: Optional[tuple[int, int]] = None,
+) -> bool:
+    """
+    INPS fissa: dal primo mese di attività fino al mese corrente (incluso).
+    Inclusi i mesi magri; esclusi mesi prima dell'inizio e mesi futuri.
+    """
+    if activity_start is None:
+        return False
+    if as_of is None:
+        as_of = as_of_month()
+    key = (int(year), int(month))
+    return activity_start <= key <= as_of
+
+
+def fixed_inps_months_in_year(
+    year: int,
+    activity_start: Optional[tuple[int, int]],
+    as_of: Optional[tuple[int, int]] = None,
+) -> int:
+    """Quanti mesi dell'anno y rientrano nella finestra fissa."""
+    return sum(
+        1
+        for m in range(1, 13)
+        if applies_fixed_inps(year, m, activity_start, as_of)
+    )
+
+
 def invoice_reserve(
     amount: float,
     f_ytd_before: float,
