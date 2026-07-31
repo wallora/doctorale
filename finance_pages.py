@@ -432,14 +432,14 @@ def delete_withdrawal(withdrawal_id: int) -> None:
 
 
 def list_collection_periods() -> list[tuple[int, int]]:
-    """Mesi con incassi (pagamento o emissione) e/o prelievi di riferimento."""
+    """Mesi con incassi (payment_date) e/o prelievi di riferimento."""
     sql = """
         SELECT y, m FROM (
             SELECT
-                EXTRACT(YEAR FROM COALESCE(payment_date, issue_date))::INTEGER AS y,
-                EXTRACT(MONTH FROM COALESCE(payment_date, issue_date))::INTEGER AS m
+                EXTRACT(YEAR FROM payment_date)::INTEGER AS y,
+                EXTRACT(MONTH FROM payment_date)::INTEGER AS m
             FROM invoices
-            WHERE COALESCE(payment_date, issue_date) IS NOT NULL
+            WHERE payment_date IS NOT NULL
             UNION
             SELECT reference_year AS y, reference_month AS m
             FROM withdrawals
@@ -455,7 +455,7 @@ def list_collection_periods() -> list[tuple[int, int]]:
 
 
 def list_invoices_for_collection(year: int, month: int) -> pd.DataFrame:
-    """Fatture il cui mese di incasso (pagamento o emissione) è year/month."""
+    """Fatture incassate nel mese (payment_date)."""
     sql = """
         SELECT
             i.id,
@@ -475,12 +475,11 @@ def list_invoices_for_collection(year: int, month: int) -> pd.DataFrame:
             ) AS lordo_senza_enasarco
         FROM invoices i
         LEFT JOIN invoice_lines l ON l.invoice_id = i.id
-        WHERE EXTRACT(YEAR FROM COALESCE(i.payment_date, i.issue_date)) = %s
-          AND EXTRACT(MONTH FROM COALESCE(i.payment_date, i.issue_date)) = %s
+        WHERE i.payment_date IS NOT NULL
+          AND EXTRACT(YEAR FROM i.payment_date) = %s
+          AND EXTRACT(MONTH FROM i.payment_date) = %s
         GROUP BY i.id
-        ORDER BY
-            COALESCE(i.payment_date, i.issue_date) ASC NULLS LAST,
-            i.number ASC
+        ORDER BY i.payment_date ASC, i.number ASC
     """
     return _read_df(sql, [year, month])
 
@@ -517,14 +516,14 @@ def enasarco_by_collection_month() -> dict[tuple[int, int], float]:
     df = _read_df(
         """
         SELECT
-            EXTRACT(YEAR FROM COALESCE(i.payment_date, i.issue_date))::INTEGER AS y,
-            EXTRACT(MONTH FROM COALESCE(i.payment_date, i.issue_date))::INTEGER AS m,
+            EXTRACT(YEAR FROM i.payment_date)::INTEGER AS y,
+            EXTRACT(MONTH FROM i.payment_date)::INTEGER AS m,
             COALESCE(SUM(l.amount), 0) AS enasarco
         FROM invoices i
         JOIN invoice_lines l ON l.invoice_id = i.id
         WHERE i.kind = 'balance'
           AND l.line_type = 'enasarco'
-          AND COALESCE(i.payment_date, i.issue_date) IS NOT NULL
+          AND i.payment_date IS NOT NULL
         GROUP BY 1, 2
         """
     )
@@ -558,7 +557,7 @@ def withdrawals_by_month() -> dict[tuple[int, int], float]:
 
 
 def list_enasarco_lines_for_collection(year: int, month: int) -> pd.DataFrame:
-    """Voci enasarco sulle fatture di saldo del mese di incasso."""
+    """Voci enasarco sulle fatture di saldo incassate nel mese."""
     sql = """
         SELECT
             i.id AS invoice_id,
@@ -568,8 +567,9 @@ def list_enasarco_lines_for_collection(year: int, month: int) -> pd.DataFrame:
             l.amount
         FROM invoices i
         JOIN invoice_lines l ON l.invoice_id = i.id
-        WHERE EXTRACT(YEAR FROM COALESCE(i.payment_date, i.issue_date)) = %s
-          AND EXTRACT(MONTH FROM COALESCE(i.payment_date, i.issue_date)) = %s
+        WHERE i.payment_date IS NOT NULL
+          AND EXTRACT(YEAR FROM i.payment_date) = %s
+          AND EXTRACT(MONTH FROM i.payment_date) = %s
           AND i.kind = 'balance'
           AND l.line_type = 'enasarco'
         ORDER BY i.number, l.sort_order, l.id
@@ -590,15 +590,12 @@ def list_withdrawals_for_month(year: int, month: int) -> pd.DataFrame:
 
 def fatturato_by_attribution_year() -> dict[int, float]:
     """
-    Fatturato annuale = somma delle voci di fattura escluse le righe enasarco
-    (incassato lordo, senza sottrarre enasarco), aggregato per anno di
-    pagamento se presente, altrimenti anno di emissione (previsione tasse).
+    Fatturato annuale = voci senza enasarco, solo fatture incassate
+    (aggregato per anno di payment_date).
     """
     sql = """
         SELECT
-            EXTRACT(
-                YEAR FROM COALESCE(i.payment_date, i.issue_date)
-            )::INTEGER AS attr_year,
+            EXTRACT(YEAR FROM i.payment_date)::INTEGER AS attr_year,
             COALESCE(
                 SUM(l.amount) FILTER (
                     WHERE l.line_type IS DISTINCT FROM 'enasarco'
@@ -607,7 +604,7 @@ def fatturato_by_attribution_year() -> dict[int, float]:
             ) AS fatturato
         FROM invoices i
         LEFT JOIN invoice_lines l ON l.invoice_id = i.id
-        WHERE COALESCE(i.payment_date, i.issue_date) IS NOT NULL
+        WHERE i.payment_date IS NOT NULL
         GROUP BY 1
         ORDER BY 1
     """
@@ -1467,7 +1464,7 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
             note = (
                 f"Quote mancanti per {attr}"
                 if attr
-                else "Senza data emissione/pagamento"
+                else "Senza data di pagamento"
             )
         else:
             v_inps = vr.inps
@@ -1621,14 +1618,14 @@ def total_ancora_prelevabile() -> float:
 def page_contabilita_mensile() -> None:
     st.subheader("Contabilità mensile")
     st.caption(
-        "Mese = data di incasso (pagamento, o emissione se ancora non pagata). "
+        "Mese = data di pagamento (solo fatture incassate). "
         "Su ogni fattura: enasarco + riserva variabile. "
         f"A livello mese: riserva certa ÷ {CERTAIN_RESERVE_MONTHS} e prelievi."
     )
 
     periods = list_collection_periods()
     if not periods:
-        st.info("Nessuna fattura con data di incasso.")
+        st.info("Nessuna fattura incassata.")
         return
 
     _colored_amount_box(
@@ -1782,8 +1779,8 @@ def page_contabilita_mensile() -> None:
     years_ctx.add(year - 1)
     with st.expander("Contesto tasse annuali (saldo su surplus + acconto)", expanded=False):
         st.caption(
-            "Fatturato = voci senza enasarco, per anno di pagamento "
-            "(se c’è) oppure emissione. La riserva certa del mese usa "
+            "Fatturato = voci senza enasarco, solo fatture con data di pagamento. "
+            "La riserva certa del mese usa "
             f"gli obblighi calcolati sul fatturato {year - 1}."
         )
         for ay in sorted(y for y in years_ctx if y > 0):
