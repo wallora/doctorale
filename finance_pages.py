@@ -1280,6 +1280,11 @@ def page_quote_annuali() -> None:
 
     values: dict[str, Any] = {}
     cols = st.columns(2)
+    # Key separate per nuovo vs modifica: altrimenti aprendo la pagina (anno
+    # corrente a 0) e poi selezionando lo stesso anno i widget restano a 0.
+    key_prefix = (
+        f"quota_edit_{year_input}" if year_locked else "quota_new"
+    )
     for i, (field, label, kind) in enumerate(QUOTA_FIELDS):
         with cols[i % 2]:
             raw = quota.get(field)
@@ -1288,10 +1293,10 @@ def page_quote_annuali() -> None:
                 pct_default = float(raw) * 100 if raw is not None else 0.0
                 pct = st.number_input(
                     label + " (%)",
-                    value=pct_default,
+                    value=float(pct_default),
                     step=0.01,
                     format="%.4f",
-                    key=f"quota_{year_input}_{field}",
+                    key=f"{key_prefix}_{field}",
                 )
                 values[field] = float(pct) / 100.0
             else:
@@ -1300,7 +1305,7 @@ def page_quote_annuali() -> None:
                     value=_money(raw) if raw is not None else 0.0,
                     step=0.01,
                     format="%.2f",
-                    key=f"quota_{year_input}_{field}",
+                    key=f"{key_prefix}_{field}",
                 )
 
     if st.button("Salva quote", type="primary", key=f"quota_save_{year_input}"):
