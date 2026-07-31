@@ -1226,9 +1226,25 @@ def page_elenco_prelievi() -> None:
 def page_quote_annuali() -> None:
     st.subheader("Aliquote")
 
+    form_key = "fin_quota_form_open"
+    if form_key not in st.session_state:
+        st.session_state[form_key] = False
+
+    h1, h2 = st.columns([6, 1])
+    with h1:
+        st.markdown("##### Elenco aliquote")
+    with h2:
+        if st.button(
+            "−" if st.session_state[form_key] else "+",
+            key="fin_quota_form_toggle",
+            help="Mostra/nascondi nuova aliquota",
+        ):
+            st.session_state[form_key] = not st.session_state[form_key]
+            st.rerun()
+
     df = list_year_quotas()
     if df.empty:
-        st.info("Nessuna quota annuale. Creane una nuova qui sotto.")
+        st.info("Nessuna aliquota. Premi + per crearne una.")
         selected_year = None
     else:
         display = pd.DataFrame(
@@ -1254,14 +1270,18 @@ def page_quote_annuali() -> None:
         selected = event.selection.rows if event and event.selection else []
         selected_year = int(df.iloc[selected[0]]["year"]) if selected else None
 
+    show_form = st.session_state[form_key] or selected_year is not None
+    if not show_form:
+        return
+
     st.markdown("---")
     if selected_year is not None:
-        st.markdown(f"##### Modifica quote {selected_year}")
+        st.markdown(f"##### Modifica aliquote {selected_year}")
         quota = get_year_quota(selected_year) or {}
         year_value = selected_year
         year_locked = True
     else:
-        st.markdown("##### Nuova / aggiorna quota annuale")
+        st.markdown("##### Nuova aliquota")
         quota = {}
         year_value = date.today().year
         year_locked = False
@@ -1308,10 +1328,11 @@ def page_quote_annuali() -> None:
                     key=f"{key_prefix}_{field}",
                 )
 
-    if st.button("Salva quote", type="primary", key=f"quota_save_{year_input}"):
+    if st.button("Salva aliquote", type="primary", key=f"quota_save_{year_input}"):
         upsert_year_quota(int(year_input), values)
         total_ancora_prelevabile.clear()
-        st.success(f"Quote {int(year_input)} salvate.")
+        st.session_state[form_key] = False
+        st.success(f"Aliquote {int(year_input)} salvate.")
         st.rerun()
 
 
