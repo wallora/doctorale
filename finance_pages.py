@@ -648,6 +648,96 @@ def _months_vector_from_map(
 
 
 @st.cache_data(ttl=120, show_spinner=False)
+def _annual_finance_bundle() -> dict[str, Any]:
+    quotas_map = _load_quotas_map()
+    fatturato_anni = fatturato_by_attribution_year()
+    all_inv = list_invoices_lordo_all()
+    res_by_id = _invoice_reserves(all_inv, quotas_map, fatturato_anni)
+
+    fat_comp = fatturato_by_competence_month()
+    fat_cassa = fatturato_by_collection_month()
+    ena_raw = enasarco_by_collection_month()
+    ena_cost = {k: -float(v) for k, v in ena_raw.items()}
+    prelievi = withdrawals_by_month()
+
+    month_acc_inv: dict[tuple[int, int], float] = {}
+    year_inps_acconto: dict[int, float] = {}
+    year_inps_saldo: dict[int, float] = {}
+    year_ir_acconto: dict[int, float] = {}
+    year_ir_saldo: dict[int, float] = {}
+
+    if not all_inv.empty:
+        for r in all_inv.itertuples(index=False):
+            key = attribution_year_month(r.issue_date, r.payment_date)
+            if key is None:
+                continue
+            res = res_by_id.get(int(r.id))
+            if res is None:
+                continue
+            y, _m = key
+            month_acc_inv[key] = month_acc_inv.get(key, 0.0) + res.totale
+            year_inps_acconto[y] = year_inps_acconto.get(y, 0.0) + res.inps_var
+            year_inps_saldo[y] = year_inps_saldo.get(y, 0.0) + res.inps_extra
+            year_ir_acconto[y] = year_ir_acconto.get(y, 0.0) + res.ir_var
+            year_ir_saldo[y] = year_ir_saldo.get(y, 0.0) + res.ir_extra
+
+    years: set[int] = set()
+    for mapping in (fat_comp, fat_cassa, ena_cost, prelievi, month_acc_inv):
+        for y, _m in mapping:
+            years.add(int(y))
+    years.update(quotas_map.keys())
+    years.update(year_inps_acconto)
+    years.update(year_inps_saldo)
+    years.update(year_ir_acconto)
+    years.update(year_ir_saldo)
+
+    monthly: dict[str, dict[int, list[float]]] = {
+        key: {} for key, _ in ANNUAL_METRICS
+    }
+    yearly: dict[int, dict[str, float]] = {}
+
+    for y in years:
+        fissa_mese = fixed_inps_month(quotas_map[y]) if y in quotas_map else 0.0
+        fissa_anno = fissa_mese * float(CERTAIN_RESERVE_MONTHS)
+        fat_c = _months_vector_from_map(fat_cassa, y)
+        ena = _months_vector_from_map(ena_cost, y)
+        acc_inv = _months_vector_from_map(month_acc_inv, y)
+        acc = [acc_inv[i] + fissa_mese for i in range(12)]
+        netto_m = [fat_c[i] - ena[i] - acc[i] for i in range(12)]
+        prel_m = _months_vector_from_map(prelievi, y)
+        fat_comp_m = _months_vector_from_map(fat_comp, y)
+
+        monthly["fatturato_competenza"][y] = fat_comp_m
+        monthly["fatturato_cassa"][y] = fat_c
+        monthly["enasarco"][y] = ena
+        monthly["prelievi"][y] = prel_m
+        monthly["accantonamenti"][y] = acc
+        monthly["netto"][y] = netto_m
+
+        inps_a = float(year_inps_acconto.get(y, 0.0))
+        inps_s = float(year_inps_saldo.get(y, 0.0))
+        ir_a = float(year_ir_acconto.get(y, 0.0))
+        ir_s = float(year_ir_saldo.get(y, 0.0))
+        fat_c_y = sum(fat_c)
+        ena_y = sum(ena)
+        netto_y = fat_c_y - ena_y - (inps_a + inps_s + ir_a + ir_s + fissa_anno)
+
+        yearly[y] = {
+            "fatturato_competenza": sum(fat_comp_m),
+            "fatturato_cassa": fat_c_y,
+            "enasarco": ena_y,
+            "inps_acconto": inps_a,
+            "inps_saldo": inps_s,
+            "ir_acconto": ir_a,
+            "ir_saldo": ir_s,
+            "inps_fissa": fissa_anno,
+            "netto": netto_y,
+            "prelievi": sum(prel_m),
+        }
+
+    return {"monthly": monthly, "yearly": yearly}
+
+
 def annual_metrics_by_year() -> dict[str, dict[int, list[float]]]:
     """
     Metriche mensili (gen–dic) per anno.
@@ -657,51 +747,12 @@ def annual_metrics_by_year() -> dict[str, dict[int, list[float]]]:
     Netto = fatturato cassa − enasarco − accantonamenti (prima dei prelievi).
     Accantonamenti = riserve su fatture + INPS fissa / 12 ogni mese.
     """
-    quotas_map = _load_quotas_map()
-    fatturato_anni = fatturato_by_attribution_year()
-    all_inv = list_invoices_lordo_all()
-    res_by_id = _invoice_reserves(all_inv, quotas_map, fatturato_anni)
+    return _annual_finance_bundle()["monthly"]
 
-    fat_comp = fatturato_by_competence_month()
-    fat_cassa = fatturato_by_collection_month()
-    ena_raw = enasarco_by_collection_month()
-    # Costo enasarco positivo (le voci in DB sono di solito negative)
-    ena_cost = {k: -float(v) for k, v in ena_raw.items()}
-    prelievi = withdrawals_by_month()
 
-    month_acc_inv: dict[tuple[int, int], float] = {}
-    if not all_inv.empty:
-        for r in all_inv.itertuples(index=False):
-            key = attribution_year_month(r.issue_date, r.payment_date)
-            if key is None:
-                continue
-            res = res_by_id.get(int(r.id))
-            if res is not None:
-                month_acc_inv[key] = month_acc_inv.get(key, 0.0) + res.totale
-
-    years: set[int] = set()
-    for mapping in (fat_comp, fat_cassa, ena_cost, prelievi, month_acc_inv):
-        for y, _m in mapping:
-            years.add(int(y))
-    years.update(quotas_map.keys())
-
-    out: dict[str, dict[int, list[float]]] = {
-        key: {} for key, _ in ANNUAL_METRICS
-    }
-    for y in years:
-        fissa = fixed_inps_month(quotas_map[y]) if y in quotas_map else 0.0
-        fat_c = _months_vector_from_map(fat_cassa, y)
-        ena = _months_vector_from_map(ena_cost, y)
-        acc_inv = _months_vector_from_map(month_acc_inv, y)
-        acc = [acc_inv[i] + fissa for i in range(12)]
-        netto = [fat_c[i] - ena[i] - acc[i] for i in range(12)]
-        out["fatturato_competenza"][y] = _months_vector_from_map(fat_comp, y)
-        out["fatturato_cassa"][y] = fat_c
-        out["enasarco"][y] = ena
-        out["prelievi"][y] = _months_vector_from_map(prelievi, y)
-        out["accantonamenti"][y] = acc
-        out["netto"][y] = netto
-    return out
+def annual_totals_by_year() -> dict[int, dict[str, float]]:
+    """Totali annuali (cassa dove applicabile) per la sezione dettaglio."""
+    return _annual_finance_bundle()["yearly"]
 
 
 def list_enasarco_lines_for_collection(year: int, month: int) -> pd.DataFrame:
@@ -1705,7 +1756,7 @@ def compute_month_figures(year: int, month: int) -> dict[str, Any]:
 
 def _clear_finance_caches() -> None:
     total_ancora_prelevabile.clear()
-    annual_metrics_by_year.clear()
+    _annual_finance_bundle.clear()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -2030,71 +2081,112 @@ def page_contabilita_annuale() -> None:
     metric_labels = {k: lab for k, lab in ANNUAL_METRICS}
 
     selected_years = st.multiselect(
-        "Anni",
+        "Anni (grafico)",
         options=years,
         default=[years[0]],
         key="fin_annual_years",
     )
-    if not selected_years:
-        st.info("Seleziona almeno un anno.")
-        return
 
-    st.markdown("##### Voci da mostrare")
+    st.markdown("##### Voci da mostrare nel grafico")
     series_specs: list[tuple[int, str]] = []
-    cols = st.columns(min(len(selected_years), 4))
-    for i, y in enumerate(selected_years):
-        with cols[i % len(cols)]:
-            st.markdown(f"**{y}**")
-            for key, label in ANNUAL_METRICS:
-                if st.checkbox(
-                    label,
-                    key=f"fin_annual_{y}_{key}",
-                    value=(key == "fatturato_cassa" and y == selected_years[0]),
-                ):
-                    series_specs.append((y, key))
+    if selected_years:
+        cols = st.columns(min(len(selected_years), 4))
+        for i, y in enumerate(selected_years):
+            with cols[i % len(cols)]:
+                st.markdown(f"**{y}**")
+                for key, label in ANNUAL_METRICS:
+                    if st.checkbox(
+                        label,
+                        key=f"fin_annual_{y}_{key}",
+                        value=(
+                            key == "fatturato_cassa" and y == selected_years[0]
+                        ),
+                    ):
+                        series_specs.append((y, key))
 
-    if not series_specs:
-        st.info("Seleziona almeno una voce.")
-        return
+    if series_specs:
+        month_labels = [_month_label(m) for m in range(1, 13)]
+        chart_data: dict[str, list[float]] = {}
+        for y, key in series_specs:
+            label = f"{y} · {metric_labels[key]}"
+            values = metrics.get(key, {}).get(y)
+            if values is None:
+                values = [0.0] * 12
+            chart_data[label] = values
 
-    month_labels = [_month_label(m) for m in range(1, 13)]
-    chart_data: dict[str, list[float]] = {}
-    for y, key in series_specs:
-        label = f"{y} · {metric_labels[key]}"
-        values = metrics.get(key, {}).get(y)
-        if values is None:
-            values = [0.0] * 12
-        chart_data[label] = values
-
-    chart_df = pd.DataFrame(chart_data, index=month_labels)
-    long = (
-        chart_df.reset_index(names="Mese")
-        .melt(id_vars="Mese", var_name="Serie", value_name="Valore")
-    )
-    chart = (
-        alt.Chart(long)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Mese:N", sort=month_labels, title=None),
-            y=alt.Y("Valore:Q", title="€"),
-            color=alt.Color("Serie:N", title=None),
-            tooltip=[
-                alt.Tooltip("Mese:N"),
-                alt.Tooltip("Serie:N"),
-                alt.Tooltip("Valore:Q", format=",.2f"),
-            ],
+        chart_df = pd.DataFrame(chart_data, index=month_labels)
+        long = (
+            chart_df.reset_index(names="Mese")
+            .melt(id_vars="Mese", var_name="Serie", value_name="Valore")
         )
-        .properties(height=400)
-    )
-    st.altair_chart(chart, width="stretch")
-
-    with st.expander("Dati tabellari", expanded=False):
-        col_config = {
-            c: st.column_config.NumberColumn(c, format="€ %.2f")
-            for c in chart_df.columns
-        }
-        st.dataframe(
-            chart_df,
-            width="stretch",
-            column_config=col_config,
+        chart = (
+            alt.Chart(long)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Mese:N", sort=month_labels, title=None),
+                y=alt.Y("Valore:Q", title="€"),
+                color=alt.Color("Serie:N", title=None),
+                tooltip=[
+                    alt.Tooltip("Mese:N"),
+                    alt.Tooltip("Serie:N"),
+                    alt.Tooltip("Valore:Q", format=",.2f"),
+                ],
+            )
+            .properties(height=400)
         )
+        st.altair_chart(chart, width="stretch")
+
+        with st.expander("Dati tabellari del grafico", expanded=False):
+            col_config = {
+                c: st.column_config.NumberColumn(c, format="€ %.2f")
+                for c in chart_df.columns
+            }
+            st.dataframe(
+                chart_df,
+                width="stretch",
+                column_config=col_config,
+            )
+    else:
+        st.info("Seleziona anni e voci per il grafico.")
+
+    st.markdown("---")
+    st.markdown("##### Dettaglio per anno")
+    st.caption(
+        "Totali annuali. Enasarco e riserve in cassa. "
+        "Netto = fatturato cassa − enasarco − INPS/IR acconto e saldo − INPS fissa "
+        "(minimale annuale), prima dei prelievi."
+    )
+    totals = annual_totals_by_year()
+    detail_rows = []
+    for y in sorted(totals.keys(), reverse=True):
+        t = totals[y]
+        detail_rows.append(
+            {
+                "Anno": y,
+                "Fatturato (competenza)": t["fatturato_competenza"],
+                "Fatturato (cassa)": t["fatturato_cassa"],
+                "Enasarco": t["enasarco"],
+                "INPS acconto": t["inps_acconto"],
+                "INPS saldo": t["inps_saldo"],
+                "IR acconto": t["ir_acconto"],
+                "IR saldo": t["ir_saldo"],
+                "INPS fissa": t["inps_fissa"],
+                "Netto": t["netto"],
+                "Prelievi": t["prelievi"],
+            }
+        )
+    detail_df = pd.DataFrame(detail_rows)
+    money_cols = [c for c in detail_df.columns if c != "Anno"]
+    st.dataframe(
+        detail_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Anno": st.column_config.NumberColumn("Anno", format="%d"),
+            **{
+                c: st.column_config.NumberColumn(c, format="€ %.2f")
+                for c in money_cols
+            },
+        },
+        key="fin_annual_detail",
+    )
