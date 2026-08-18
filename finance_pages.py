@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import altair as alt
 import pandas as pd
+import psycopg2
 import psycopg2.extras
 import streamlit as st
 
@@ -263,6 +264,40 @@ def list_invoice_lines(invoice_id: int) -> pd.DataFrame:
         ORDER BY sort_order ASC, id ASC
     """
     return _read_df(sql, [invoice_id])
+
+
+def next_invoice_number(series_year: int) -> int:
+    """Prossimo numero libero per l'anno di numerazione."""
+    sql = """
+        SELECT COALESCE(MAX(number), 0) + 1
+        FROM invoices
+        WHERE series_year = %s
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [int(series_year)])
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 1
+
+
+def insert_invoice(data: dict[str, Any]) -> int:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO invoices (
+                    number, kind, issue_date, payment_date, series_year,
+                    reference_year, reference_month, notes, updated_at
+                ) VALUES (
+                    %(number)s, %(kind)s, %(issue_date)s, %(payment_date)s,
+                    %(series_year)s, %(reference_year)s, %(reference_month)s,
+                    %(notes)s, NOW()
+                )
+                RETURNING id
+                """,
+                data,
+            )
+            return int(cur.fetchone()[0])
 
 
 def update_invoice(invoice_id: int, data: dict[str, Any]) -> None:
@@ -903,8 +938,182 @@ def _optional_year_select(
     return int(choice)
 
 
+def _invoice_lines_from_edited(
+    edited: pd.DataFrame,
+) -> Optional[list[dict[str, Any]]]:
+    """Estrae le voci dall'editor; None se la validazione fallisce."""
+    lines: list[dict[str, Any]] = []
+    if edited is None or edited.empty:
+        return lines
+    for i, row in edited.iterrows():
+        lt = row.get("line_type")
+        if not lt or (isinstance(lt, float) and pd.isna(lt)):
+            continue
+        if lt not in LINE_TYPE_LABELS:
+            st.error(f"Tipo voce non valido: {lt}")
+            return None
+        amt = row.get("amount")
+        if amt is None or (isinstance(amt, float) and pd.isna(amt)):
+            st.error("Ogni voce deve avere un importo.")
+            return None
+        desc = row.get("description")
+        if desc is None or (isinstance(desc, float) and pd.isna(desc)):
+            desc = ""
+        lines.append(
+            {
+                "line_type": str(lt),
+                "description": str(desc),
+                "amount": _money(amt),
+                "sort_order": int(i) if isinstance(i, int) else len(lines),
+            }
+        )
+    return lines
+
+
+def _new_invoice_form() -> None:
+    today = date.today()
+    default_series = today.year
+    default_number = next_invoice_number(default_series)
+
+    st.markdown("##### Nuova fattura")
+    st.caption("La fattura viene salvata solo con il pulsante in fondo al form.")
+    with st.form("fin_inv_new_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            series_year = st.number_input(
+                "Anno numerazione",
+                min_value=2000,
+                max_value=2100,
+                step=1,
+                value=default_series,
+            )
+            number = st.number_input(
+                "Numero",
+                min_value=1,
+                step=1,
+                value=default_number,
+            )
+        with c2:
+            kind = st.selectbox(
+                "Tipo",
+                options=INVOICE_KIND_OPTIONS,
+                format_func=lambda k: INVOICE_KIND_LABELS[k],
+                index=INVOICE_KIND_OPTIONS.index("balance"),
+            )
+        with c3:
+            ref_year = st.number_input(
+                "Anno competenza",
+                min_value=2000,
+                max_value=2100,
+                step=1,
+                value=today.year,
+            )
+        with c4:
+            ref_month = st.selectbox(
+                "Mese competenza",
+                options=list(range(1, 13)),
+                format_func=_month_label,
+                index=today.month - 1,
+            )
+
+        d1, d2 = st.columns(2)
+        with d1:
+            issue_date = st.date_input("Data emissione", value=today)
+        with d2:
+            collected = st.checkbox("Incassata", value=False)
+            payment_date_value = st.date_input("Data pagamento", value=today)
+        st.caption(
+            "La data di pagamento viene salvata solo se «Incassata» è selezionato."
+        )
+
+        notes = st.text_area("Note", value="")
+
+        st.markdown("###### Voci di dettaglio")
+        edited = st.data_editor(
+            pd.DataFrame(
+                {
+                    "line_type": pd.Series(dtype="object"),
+                    "description": pd.Series(dtype="object"),
+                    "amount": pd.Series(dtype="float"),
+                }
+            ),
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "line_type": st.column_config.SelectboxColumn(
+                    "Tipo voce",
+                    options=LINE_TYPE_OPTIONS,
+                    required=True,
+                    format_func=lambda k: LINE_TYPE_LABELS.get(k, k),
+                ),
+                "description": st.column_config.TextColumn("Descrizione"),
+                "amount": st.column_config.NumberColumn(
+                    "Importo (€)",
+                    format="%.2f",
+                    required=True,
+                ),
+            },
+            key="fin_inv_new_lines",
+        )
+
+        saved = st.form_submit_button("Salva fattura", type="primary")
+        if not saved:
+            return
+
+        lines = _invoice_lines_from_edited(edited)
+        if lines is None:
+            return
+
+        try:
+            invoice_id = insert_invoice(
+                {
+                    "number": int(number),
+                    "kind": kind,
+                    "issue_date": issue_date,
+                    "payment_date": payment_date_value if collected else None,
+                    "series_year": int(series_year),
+                    "reference_year": int(ref_year),
+                    "reference_month": int(ref_month),
+                    "notes": notes or "",
+                }
+            )
+        except psycopg2.IntegrityError:
+            st.error(
+                f"Esiste già la fattura {int(series_year)}-{int(number):02d}."
+            )
+            return
+
+        if lines:
+            replace_invoice_lines(invoice_id, lines)
+        _clear_finance_caches()
+        st.session_state["fin_inv_form_open"] = False
+        st.success(
+            f"Creata fattura {int(series_year)}-{int(number):02d}."
+        )
+        st.rerun()
+
+
 def page_elenco_fatture() -> None:
-    st.subheader("Elenco fatture")
+    form_key = "fin_inv_form_open"
+    if form_key not in st.session_state:
+        st.session_state[form_key] = False
+
+    h1, h2 = st.columns([6, 1])
+    with h1:
+        st.subheader("Elenco fatture")
+    with h2:
+        if st.button(
+            "−" if st.session_state[form_key] else "+",
+            key="fin_inv_form_toggle",
+            help="Mostra/nascondi nuova fattura",
+        ):
+            st.session_state[form_key] = not st.session_state[form_key]
+            st.rerun()
+
+    if st.session_state[form_key]:
+        _new_invoice_form()
+        st.markdown("---")
 
     year_opts = list_invoice_year_options()
     total_lo, total_hi = invoice_lines_total_bounds()
@@ -1114,6 +1323,7 @@ def page_elenco_fatture() -> None:
                 "notes": notes or "",
             },
         )
+        _clear_finance_caches()
         st.success("Testata aggiornata.")
         st.rerun()
 
@@ -1163,30 +1373,11 @@ def page_elenco_fatture() -> None:
         st.caption(f"Totale voci: **{_fmt_euro(total)}**")
 
     if st.button("Salva voci", type="primary", key=f"inv_save_l_{invoice_id}"):
-        lines: list[dict[str, Any]] = []
-        for i, row in edited.iterrows():
-            lt = row.get("line_type")
-            if not lt or (isinstance(lt, float) and pd.isna(lt)):
-                continue
-            if lt not in LINE_TYPE_LABELS:
-                st.error(f"Tipo voce non valido: {lt}")
-                return
-            amt = row.get("amount")
-            if amt is None or (isinstance(amt, float) and pd.isna(amt)):
-                st.error("Ogni voce deve avere un importo.")
-                return
-            desc = row.get("description")
-            if desc is None or (isinstance(desc, float) and pd.isna(desc)):
-                desc = ""
-            lines.append(
-                {
-                    "line_type": str(lt),
-                    "description": str(desc),
-                    "amount": _money(amt),
-                    "sort_order": int(i) if isinstance(i, int) else len(lines),
-                }
-            )
+        lines = _invoice_lines_from_edited(edited)
+        if lines is None:
+            return
         replace_invoice_lines(invoice_id, lines)
+        _clear_finance_caches()
         st.success(f"Salvate {len(lines)} voci.")
         st.rerun()
 
