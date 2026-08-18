@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS calendar_reminders_sent (
     sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (reminder_key, year)
 );
+
+ALTER TABLE payment_reminders_sent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE calendar_reminders_sent ENABLE ROW LEVEL SECURITY;
 """
 
 DUE_SQL = """

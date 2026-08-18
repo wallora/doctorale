@@ -127,7 +127,9 @@ CREATE INDEX IF NOT EXISTS withdrawals_period_idx
     ON withdrawals (reference_year, reference_month);
 
 -- Vista di comodo: totale fattura dalle righe (+ legacy se senza righe)
-CREATE OR REPLACE VIEW invoice_totals AS
+-- security_invoker: RLS del chiamante, non del creatore (lint Supabase 0010)
+CREATE OR REPLACE VIEW invoice_totals
+WITH (security_invoker = true) AS
 SELECT
     i.id,
     i.number,
