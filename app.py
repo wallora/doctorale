@@ -286,10 +286,11 @@ def get_connection() -> Iterator[psycopg2.extensions.connection]:
         conn.close()
 
 
-def init_db() -> None:
-    """Verifica doctors e crea sales_data se manca."""
+def ensure_db_ready() -> None:
+    """Verifica connessione DB e tabella medici (leggero, ad ogni avvio)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT 1")
             cur.execute(
                 """
                 SELECT 1
@@ -304,6 +305,11 @@ def init_db() -> None:
                     "Creala dall'SQL Editor prima di usare l'app."
                 )
 
+
+def _bootstrap_sales_data_schema() -> None:
+    """Crea/aggiorna sales_data e indici (una tantum per processo)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {SALES_TABLE} (
@@ -323,8 +329,6 @@ def init_db() -> None:
                 )
                 """
             )
-            # Chiave primaria logica: microarea (+ periodo/metrica/prodotto).
-            # L'informatore è uno snapshot storico del periodo (può cambiare nel tempo).
             cur.execute(f"DROP INDEX IF EXISTS {SALES_TABLE}_uniq")
             cur.execute(
                 f"""
@@ -348,7 +352,6 @@ def init_db() -> None:
             )
             cur.execute(f"ALTER TABLE {SALES_TABLE} ENABLE ROW LEVEL SECURITY")
 
-            # Ferrari Raffaella è l'AM, non un informatore
             cur.execute(
                 f"""
                 DELETE FROM {SALES_TABLE}
@@ -367,6 +370,19 @@ def init_db() -> None:
                   AND informatore <> ''
                 """
             )
+
+
+@st.cache_resource
+def ensure_sales_data_ready() -> bool:
+    """Bootstrap sales_data al primo accesso alla sezione Dati."""
+    _bootstrap_sales_data_schema()
+    return True
+
+
+def init_db() -> None:
+    """Compatibilità: verifica medici + bootstrap vendite."""
+    ensure_db_ready()
+    ensure_sales_data_ready()
 
 
 def _date_to_str(value: Optional[date]) -> Optional[str]:
@@ -2239,7 +2255,7 @@ def main() -> None:
     )
 
     try:
-        init_db()
+        ensure_db_ready()
     except Exception as exc:
         st.error(f"Errore di connessione al database: {exc}")
         st.stop()
@@ -2315,6 +2331,7 @@ def main() -> None:
         else:
             page_contabilita_mensile()
     elif sezione == "Dati":
+        ensure_sales_data_ready()
         if pagina_dati == "Importa":
             page_dati_importa()
         else:
